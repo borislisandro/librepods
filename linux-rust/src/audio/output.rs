@@ -176,7 +176,7 @@ pub fn source_consumer(name: &str) -> Option<String> {
 }
 
 // A2DP transport reset:
-// We found that in some cases A2DP has to be suspended and resumed after a 0x58 mic start/stop
+// We found that in some cases A2DP has to be suspended and resumed after a 0x58 mic start
 // to avoid a corrupted transport state of the airpods.
 pub fn reset_a2dp(bdaddr: &str) {
     if !crate::utils::AppSettings::load().a2dp_reset {
