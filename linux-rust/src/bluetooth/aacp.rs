@@ -818,6 +818,10 @@ impl AACPManager {
                 }
             }
             opcodes::EAR_DETECTION => {
+                if packet.len() < 8 {
+                    error!("Ear detection packet too short: {}", hex::encode(packet));
+                    return;
+                }
                 let primary_status = packet[6];
                 let secondary_status = packet[7];
                 let mut statuses = Vec::new();
@@ -907,7 +911,9 @@ impl AACPManager {
                         strings.push(s.to_string());
                     }
                 }
-                strings.remove(0);
+                if !strings.is_empty() {
+                    strings.remove(0);
+                }
                 let info = AirPodsInformation {
                     name: strings.first().cloned().unwrap_or_default(),
                     model_number: strings.get(1).cloned().unwrap_or_default(),
@@ -932,16 +938,11 @@ impl AACPManager {
                     device_data.name = info.name.clone();
                     device_data.information = Some(DeviceInformation::AirPods(info.clone()));
                 }
-                let json = serde_json::to_string(&state.devices).unwrap();
-                if let Some(parent) = get_devices_path().parent()
-                    && let Err(e) = tokio::fs::create_dir_all(&parent).await
-                {
-                    error!("Failed to create directory for devices: {}", e);
-                    return;
-                }
-                if let Err(e) = tokio::fs::write(&get_devices_path(), json).await {
-                    error!("Failed to save devices: {}", e);
-                }
+                let json = serde_json::to_string(&state.devices);
+                // Don't hold the AACP state lock across disk I/O: every incoming
+                // packet needs it.
+                drop(state);
+                save_devices_json(json).await;
                 info!("Received Information: {:?}", info);
             }
 
@@ -1019,16 +1020,11 @@ impl AACPManager {
                         }
                     }
                 }
-                let json = serde_json::to_string(&state.devices).unwrap();
-                if let Some(parent) = get_devices_path().parent()
-                    && let Err(e) = tokio::fs::create_dir_all(&parent).await
-                {
-                    error!("Failed to create directory for devices: {}", e);
-                    return;
-                }
-                if let Err(e) = tokio::fs::write(&get_devices_path(), json).await {
-                    error!("Failed to save devices: {}", e);
-                }
+                let json = serde_json::to_string(&state.devices);
+                // Don't hold the AACP state lock across disk I/O: every incoming
+                // packet needs it.
+                drop(state);
+                save_devices_json(json).await;
             }
             opcodes::STEM_PRESS => {
                 if payload.len() < 4 {
@@ -1117,7 +1113,7 @@ impl AACPManager {
                 info!("Received Connected Devices: {:?}", state.connected_devices);
             }
             opcodes::SMART_ROUTING_RESP => {
-                let packet_string = String::from_utf8_lossy(&payload[2..]);
+                let packet_string = String::from_utf8_lossy(payload.get(2..).unwrap_or(&[]));
                 info!("Received Smart Routing Response: {}", packet_string);
                 if packet_string.contains("SetOwnershipToFalse") {
                     info!("Received OwnershipToFalse request");
@@ -1437,6 +1433,26 @@ impl AACPManager {
     pub async fn send_some_packet(&self) -> Result<()> {
         self.send_data_packet(&[0x29, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
             .await
+    }
+}
+
+/// Persist the devices file (atomically, off the async runtime).
+async fn save_devices_json(json: serde_json::Result<String>) {
+    let json = match json {
+        Ok(j) => j,
+        Err(e) => {
+            error!("Failed to serialize devices: {}", e);
+            return;
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        crate::utils::write_atomic(&get_devices_path(), json.as_bytes())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!("Failed to save devices: {}", e),
+        Err(e) => error!("Failed to save devices: {}", e),
     }
 }
 

@@ -13,6 +13,22 @@ pub fn get_devices_path() -> PathBuf {
         .join("devices.json")
 }
 
+/// Write a file atomically: write a temp file next to it, then rename over it.
+/// A plain fs::write truncates first, so a concurrent reader (settings and the
+/// devices file are read all the time) could see an empty or partial file, fall
+/// back to defaults, and the next save would overwrite the user's data with them.
+pub fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!(
+        "tmp.{}",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)
+}
+
 pub fn ensure_device_registered(mac: &str, name: &str, type_: crate::devices::enums::DeviceType) {
     use crate::devices::enums::DeviceData;
     use std::collections::HashMap;
@@ -37,7 +53,7 @@ pub fn ensure_device_registered(mac: &str, name: &str, type_: crate::devices::en
     }
     match serde_json::to_string(&devices) {
         Ok(updated) => {
-            if let Err(e) = std::fs::write(&path, updated) {
+            if let Err(e) = write_atomic(&path, updated.as_bytes()) {
                 log::error!("Failed to write devices file: {}", e);
             }
         }
@@ -216,7 +232,7 @@ impl AppSettings {
         }
         match serde_json::to_string_pretty(self) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                if let Err(e) = write_atomic(&path, json.as_bytes()) {
                     log::error!("Failed to write app settings: {}", e);
                 }
             }
