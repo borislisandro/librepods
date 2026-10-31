@@ -274,6 +274,7 @@ async fn monitor_loop(
                     capture = Some(c);
 
                     // Only disable (and remember to restore) if it was on.
+                    aacp.take_convo_user_changed();
                     if crate::utils::AppSettings::load().hires_mic_pause_convo
                         && aacp.conversation_detection_enabled().await
                     {
@@ -379,6 +380,10 @@ async fn monitor_loop(
 /// already gone (disconnect mid-call), remember it so the next connection
 /// restores it; otherwise it stayed off on the AirPods for good.
 async fn restore_conversation_detection(aacp: &AACPManager, enabled: bool) {
+    if aacp.take_convo_user_changed() {
+        info!("[hires] conversation awareness was changed by the user; not restoring it");
+        return;
+    }
     if !aacp.set_conversation_detection(enabled).await && enabled {
         info!("[hires] AirPods gone; will restore conversation awareness on next connect");
         let mut settings = crate::utils::AppSettings::load();

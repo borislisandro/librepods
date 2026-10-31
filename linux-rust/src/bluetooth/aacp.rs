@@ -399,6 +399,9 @@ pub struct AACPManager {
     connected: Arc<watch::Sender<bool>>,
     /// Incremented on every ear-detection report.
     ear_generation: Arc<AtomicU64>,
+    /// The user changed conversation awareness while a capture had it
+    /// overridden; the capture then must not restore its saved value.
+    convo_user_changed: Arc<AtomicBool>,
 }
 
 impl AACPManager {
@@ -415,7 +418,42 @@ impl AACPManager {
             runtime: tokio::runtime::Handle::current(),
             connected: Arc::new(watch::channel(false).0),
             ear_generation: Arc::new(AtomicU64::new(0)),
+            convo_user_changed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        *self.connected.borrow()
+    }
+
+    /// Tear this connection down from outside: used when BlueZ reports the
+    /// AirPods connected again while our old L2CAP link hasn't noticed it died
+    /// (otherwise two full device stacks ran side by side for minutes).
+    pub async fn close(&self) {
+        self.tasks.lock().await.abort_all();
+        {
+            let mut state = self.state.lock().await;
+            state.sender = None;
+            state.owns = false;
+            state.connected_devices.clear();
+            state.ear_detection_status.clear();
+            state.old_ear_detection_status.clear();
+            state.audio_tx = None;
+        }
+        self.connected.send_replace(false);
+        self.disarm_hires_mic().await;
+    }
+
+    /// Conversation awareness changed from the UI.
+    pub async fn set_conversation_detection_by_user(&self, enabled: bool) -> bool {
+        self.convo_user_changed.store(true, Ordering::Relaxed);
+        self.set_conversation_detection(enabled).await
+    }
+
+    /// Whether the user changed conversation awareness since the last call (and
+    /// clear the flag).
+    pub fn take_convo_user_changed(&self) -> bool {
+        self.convo_user_changed.swap(false, Ordering::Relaxed)
     }
 
     /// True if a device other than this computer is currently playing media or
