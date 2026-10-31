@@ -134,7 +134,7 @@ impl AirPodsDevice {
         }
 
         let aacp_manager_clone = aacp_manager.clone();
-        tokio::spawn(async move {
+        spawn_for_connection(&aacp_manager, async move {
             while let Some((id, value)) = command_rx.recv().await {
                 if let Err(e) = aacp_manager_clone.send_control_command(id, &value).await {
                     log::error!("Failed to send control command: {}", e);
@@ -157,7 +157,7 @@ impl AirPodsDevice {
             )
             .await;
         let tray_handle_clone = tray_handle.clone();
-        tokio::spawn(async move {
+        spawn_for_connection(&aacp_manager, async move {
             while let Some(value) = listening_mode_rx.recv().await {
                 if let Some(handle) = &tray_handle_clone {
                     handle
@@ -174,7 +174,7 @@ impl AirPodsDevice {
             .subscribe_to_control_command(ControlCommandIdentifiers::AllowOffOption, allow_off_tx)
             .await;
         let tray_handle_clone = tray_handle.clone();
-        tokio::spawn(async move {
+        spawn_for_connection(&aacp_manager, async move {
             while let Some(value) = allow_off_rx.recv().await {
                 if let Some(handle) = &tray_handle_clone {
                     handle
@@ -195,7 +195,7 @@ impl AirPodsDevice {
             )
             .await;
         let tray_handle_clone = tray_handle.clone();
-        tokio::spawn(async move {
+        spawn_for_connection(&aacp_manager, async move {
             while let Some(value) = conversation_detect_rx.recv().await {
                 if let Some(handle) = &tray_handle_clone {
                     handle
@@ -215,7 +215,7 @@ impl AirPodsDevice {
             )
             .await;
         let mc_clone_owns = media_controller.clone();
-        tokio::spawn(async move {
+        spawn_for_connection(&aacp_manager, async move {
             while let Some(value) = owns_connection_rx.recv().await {
                 let owns = value.first().copied().unwrap_or(0) != 0;
                 if !owns {
@@ -231,7 +231,7 @@ impl AirPodsDevice {
         let local_mac_events = local_mac.clone();
         let ui_tx_clone = ui_tx.clone();
         let command_tx_clone = command_tx.clone();
-        tokio::spawn(async move {
+        spawn_for_connection(&aacp_manager, async move {
             while let Some(event) = rx.recv().await {
                 let event_clone = event.clone();
                 match event {
@@ -395,6 +395,23 @@ impl AirPodsDevice {
             // command_tx: Some(command_tx.clone()),
         }
     }
+}
+
+/// Run a per-connection task until it finishes or the AACP connection drops,
+/// whichever comes first. These loops hold AACPManager clones (and channels the
+/// manager's state holds the other end of), so without this they never end and
+/// pile up with every reconnect.
+fn spawn_for_connection<F>(aacp: &AACPManager, fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let aacp = aacp.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = aacp.disconnected() => {}
+            _ = fut => {}
+        }
+    });
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

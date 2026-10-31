@@ -125,7 +125,14 @@ impl MediaController {
     ) {
         info!("Starting playback listener loop");
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::select! {
+                _ = aacp_manager.disconnected() => {
+                    info!("AirPods disconnected, stopping playback listener");
+                    self.state.lock().await.playback_listener_running = false;
+                    return;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
 
             let is_playing = tokio::task::spawn_blocking(|| Self::check_if_playing())
                 .await

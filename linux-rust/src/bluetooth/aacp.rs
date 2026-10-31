@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep};
 
@@ -393,6 +393,10 @@ pub struct AACPManager {
     /// Handle to the long-lived backend runtime, so the hi-res monitor task
     /// survives even when armed from a throwaway runtime (the UI toggle thread).
     runtime: tokio::runtime::Handle,
+    /// true while the L2CAP control channel is up. Per-connection tasks (playback
+    /// listener, command/subscriber loops) watch this and exit when it drops, so
+    /// they don't pile up across reconnects.
+    connected: Arc<watch::Sender<bool>>,
 }
 
 impl AACPManager {
@@ -407,7 +411,22 @@ impl AACPManager {
             hires_wake: Arc::new(Notify::new()),
             mic_status: crate::audio::hires_mic::MicStatus::new(),
             runtime: tokio::runtime::Handle::current(),
+            connected: Arc::new(watch::channel(false).0),
         }
+    }
+
+    /// Resolves once this connection has ended (immediately if it never came up).
+    pub async fn disconnected(&self) {
+        let mut rx = self.connected.subscribe();
+        let _ = rx.wait_for(|up| !*up).await;
+    }
+
+    /// True if at least one bud is in an ear. An empty status (not reported yet,
+    /// or ear detection off on the AirPods) counts as wearing so it never blocks.
+    pub async fn is_worn(&self) -> bool {
+        let state = self.state.lock().await;
+        state.ear_detection_status.is_empty()
+            || state.ear_detection_status.contains(&EarDetectionStatus::InEar)
     }
 
     pub async fn conversation_detection_enabled(&self) -> bool {
@@ -582,6 +601,7 @@ impl AACPManager {
             state.sender = Some(tx);
         }
 
+        self.connected.send_replace(true);
         let mut tasks = self.tasks.lock().await;
         tasks.spawn(recv_thread(manager_clone, seq_packet.clone()));
         tasks.spawn(send_thread(rx, seq_packet));
@@ -1422,7 +1442,11 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
     {
         let mut state = manager.state.lock().await;
         state.sender = None;
+        // Stale "InEar" would otherwise drive takeover / mic decisions later.
+        state.ear_detection_status.clear();
+        state.old_ear_detection_status.clear();
     }
+    manager.connected.send_replace(false);
     manager.disarm_hires_mic().await;
 }
 
