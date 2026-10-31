@@ -25,6 +25,7 @@ impl AirPodsDevice {
         mac_address: Address,
         tray_handle: Option<Handle<MyTray>>,
         ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
+        local_mac: String,
     ) -> Self {
         info!("Creating new AirPodsDevice for {}", mac_address);
         let mut aacp_manager = AACPManager::new();
@@ -104,19 +105,6 @@ impl AirPodsDevice {
                 error!("Failed to enable stem press detection: {}", e);
             }
         }
-
-        let session = bluer::Session::new()
-            .await
-            .expect("Failed to get bluer session");
-        let adapter = session
-            .default_adapter()
-            .await
-            .expect("Failed to get default adapter");
-        let local_mac = adapter
-            .address()
-            .await
-            .expect("Failed to get adapter address")
-            .to_string();
 
         let media_controller = Arc::new(Mutex::new(MediaController::new(
             mac_address.to_string(),

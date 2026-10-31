@@ -675,11 +675,12 @@ impl MediaController {
         debug!("Entering deactivate_a2dp_profile");
         let mut state = self.state.lock().await;
 
-        if state.device_index.is_none() {
-            state.device_index = self
-                .get_audio_device_index(&state.connected_device_mac)
-                .await;
-        }
+        // Fresh lookup: a cached index is stale once the card was recreated
+        // (reconnect, PipeWire restart), and setting a profile on it fails.
+        // (get_audio_device_index doesn't take the state lock.)
+        state.device_index = self
+            .get_audio_device_index(&state.connected_device_mac)
+            .await;
 
         if state.connected_device_mac.is_empty() || state.device_index.is_none() {
             warn!("Connected device MAC or index is empty, cannot deactivate A2DP profile");

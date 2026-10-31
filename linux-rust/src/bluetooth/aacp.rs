@@ -539,7 +539,24 @@ impl AACPManager {
         }
     }
 
+    /// Open the AACP control channel, retrying a few times: right after the
+    /// AirPods connect the L2CAP channel can be refused or time out, and a single
+    /// failed attempt used to leave the device half-initialised until the next
+    /// reconnect.
     pub async fn connect(&mut self, addr: Address) {
+        for (attempt, backoff) in [1u64, 2, 4].into_iter().enumerate() {
+            if self.try_connect(addr).await {
+                return;
+            }
+            if attempt < 2 {
+                warn!("AACP connect attempt {} failed; retrying in {}s", attempt + 1, backoff);
+                sleep(Duration::from_secs(backoff)).await;
+            }
+        }
+        error!("Could not open the AACP channel to {}", addr);
+    }
+
+    async fn try_connect(&mut self, addr: Address) -> bool {
         info!("AACPManager connecting to {} on PSM {:#06X}...", addr, PSM);
         let target_sa = SocketAddr::new(addr, AddressType::BrEdr, PSM);
 
@@ -552,7 +569,7 @@ impl AACPManager {
             Ok(s) => s,
             Err(e) => {
                 error!("Failed to create L2CAP socket: {}", e);
-                return;
+                return false;
             }
         };
 
@@ -561,11 +578,11 @@ impl AACPManager {
                 Ok(Ok(s)) => Arc::new(s),
                 Ok(Err(e)) => {
                     error!("L2CAP connect failed: {}", e);
-                    return;
+                    return false;
                 }
                 Err(_) => {
                     error!("L2CAP connect timed out");
-                    return;
+                    return false;
                 }
             };
 
@@ -579,14 +596,14 @@ impl AACPManager {
                     if e.raw_os_error() == Some(107) {
                         // ENOTCONN
                         error!("Peer has disconnected during connection setup.");
-                        return;
+                        return false;
                     }
                     error!("Error getting peer address: {}", e);
                 }
             }
             if start.elapsed() >= CONNECT_TIMEOUT {
                 error!("Timed out waiting for L2CAP connection to be fully established.");
-                return;
+                return false;
             }
             sleep(POLL_INTERVAL).await;
         }
@@ -605,6 +622,7 @@ impl AACPManager {
         let mut tasks = self.tasks.lock().await;
         tasks.spawn(recv_thread(manager_clone, seq_packet.clone()));
         tasks.spawn(send_thread(rx, seq_packet));
+        true
     }
 
     async fn send_packet(&self, data: &[u8]) -> Result<()> {

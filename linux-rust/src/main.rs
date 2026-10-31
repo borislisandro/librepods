@@ -94,15 +94,22 @@ fn main() -> iced::Result {
         // Run headless without UI
         info!("Running in headless mode (no GUI)");
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async_main(ui_tx, device_managers)).unwrap();
+        if let Err(e) = rt.block_on(async_main(ui_tx, device_managers)) {
+            log::error!("Bluetooth backend stopped: {}", e);
+            std::process::exit(1);
+        }
         Ok(())
     } else {
         // Run with UI
         let device_managers_clone = device_managers.clone();
         std::thread::spawn(|| {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async_main(ui_tx, device_managers_clone))
-                .unwrap();
+            // Exit cleanly (no panic, no core dump / crash dialog) if the backend
+            // can't run, e.g. no Bluetooth adapter appeared in time.
+            if let Err(e) = rt.block_on(async_main(ui_tx, device_managers_clone)) {
+                log::error!("Bluetooth backend stopped: {}", e);
+                std::process::exit(1);
+            }
         });
 
         ui::window::start_ui(ui_rx, args.start_minimized, device_managers)
@@ -170,8 +177,9 @@ async fn async_main(
     };
 
     let session = bluer::Session::new().await?;
-    let adapter = session.default_adapter().await?;
+    let adapter = wait_for_adapter(&session).await?;
     adapter.set_powered(true).await?;
+    let local_mac = adapter.address().await?.to_string();
 
     let le_tray_clone = tray_handle.clone();
     tokio::spawn(async move {
@@ -196,8 +204,13 @@ async fn async_main(
                 &name,
                 devices::enums::DeviceType::AirPods,
             );
-            let airpods_device =
-                AirPodsDevice::new(device.address(), tray_handle.clone(), ui_tx.clone()).await;
+            let airpods_device = AirPodsDevice::new(
+                device.address(),
+                tray_handle.clone(),
+                ui_tx.clone(),
+                local_mac.clone(),
+            )
+            .await;
 
             let hires_aacp = airpods_device.aacp_manager.clone();
             let mut managers = device_managers.write().await;
@@ -345,8 +358,10 @@ async fn async_main(
         let handle_clone = tray_handle.clone();
         let ui_tx_clone = ui_tx.clone();
         let device_managers = device_managers.clone();
+        let local_mac = local_mac.clone();
         tokio::spawn(async move {
-            let airpods_device = AirPodsDevice::new(addr, handle_clone, ui_tx_clone.clone()).await;
+            let airpods_device =
+                AirPodsDevice::new(addr, handle_clone, ui_tx_clone.clone(), local_mac).await;
             let mut managers = device_managers.write().await;
             // let dev_managers = DeviceManagers::with_both(airpods_device.aacp_manager.clone(), airpods_device.att_manager.clone());
             let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
@@ -365,6 +380,25 @@ async fn async_main(
     info!("Listening for Bluetooth connections via D-Bus...");
     loop {
         conn.process(std::time::Duration::from_millis(1000))?;
+    }
+}
+
+/// The adapter can appear a moment after we start (USB dongle plugged in, BlueZ
+/// still registering it). Wait up to ~20 s instead of failing right away.
+async fn wait_for_adapter(session: &bluer::Session) -> bluer::Result<bluer::Adapter> {
+    let mut attempt = 0;
+    loop {
+        match session.default_adapter().await {
+            Ok(adapter) => return Ok(adapter),
+            Err(e) if attempt < 20 => {
+                if attempt == 0 {
+                    info!("Waiting for a Bluetooth adapter ({})", e);
+                }
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
