@@ -26,6 +26,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(400);
 const STALL_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Upper bound for the delay between stall restarts that keep failing.
 const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(30);
+/// After this many restarts in a row without audio, stop retrying until the ear
+/// state changes (e.g. the remaining bud doesn't stream its mic): each restart
+/// cycles A2DP, an audible cut.
+const MAX_FAILED_RESTARTS: u32 = 3;
 const LEVEL_RELEASE: f32 = 0.85;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -36,9 +40,8 @@ enum CaptureAction {
     Keep,
     /// Capturing but no audio SDUs for STALL_TIMEOUT while worn: STOP + START.
     Restart,
-    /// Capture must end. `reset_a2dp`: cycle A2DP afterwards (only while worn;
-    /// when the buds came out the next START resets anyway).
-    Stop { reset_a2dp: bool },
+    /// Capture must end (STOP, then an A2DP reset).
+    Stop,
     /// Not capturing and nothing to start.
     Idle,
 }
@@ -58,7 +61,7 @@ fn capture_action(
         (true, false) => CaptureAction::Start,
         (true, true) if stalled => CaptureAction::Restart,
         (true, true) => CaptureAction::Keep,
-        (false, true) => CaptureAction::Stop { reset_a2dp: worn },
+        (false, true) => CaptureAction::Stop,
         (false, false) => CaptureAction::Idle,
     }
 }
@@ -186,6 +189,9 @@ async fn monitor_loop(
     let mut old_convo_state: Option<bool> = None;
     let mut restart_backoff = STALL_TIMEOUT;
     let mut next_restart_at = Instant::now();
+    let mut failed_restarts: u32 = 0;
+    // Ear generation at which we gave up restarting; retry once it changes.
+    let mut gave_up_at_ear: Option<u64> = None;
     info!(
         "[hires] activity monitor started, watching '{}'",
         output::SOURCE_NAME
@@ -227,10 +233,31 @@ async fn monitor_loop(
             CaptureAction::Keep => {
                 status.set_capture(app);
                 restart_backoff = STALL_TIMEOUT;
+                failed_restarts = 0;
+                gave_up_at_ear = None;
             }
             CaptureAction::Restart => {
                 status.set_capture(app);
+                if let Some(generation) = gave_up_at_ear {
+                    if aacp.ear_generation() == generation {
+                        continue;
+                    }
+                    info!("[hires] ear state changed; retrying the mic stream");
+                    gave_up_at_ear = None;
+                    failed_restarts = 0;
+                    restart_backoff = STALL_TIMEOUT;
+                    next_restart_at = Instant::now();
+                }
+                if failed_restarts >= MAX_FAILED_RESTARTS {
+                    warn!(
+                        "[hires] no mic audio after {} restarts; waiting for an ear change",
+                        failed_restarts
+                    );
+                    gave_up_at_ear = Some(aacp.ear_generation());
+                    continue;
+                }
                 if Instant::now() >= next_restart_at {
+                    failed_restarts += 1;
                     warn!(
                         "[hires] no audio from device for {}ms, restarting capture",
                         STALL_TIMEOUT.as_millis()
@@ -251,7 +278,7 @@ async fn monitor_loop(
             // Disabled, recorder gone, or no bud in an ear: end the 0x58 stream.
             // The virtual source stays up feeding silence, so an active recorder
             // isn't dropped onto the AirPods' HFP mic (handsfree) or another mic.
-            CaptureAction::Stop { reset_a2dp } => {
+            CaptureAction::Stop => {
                 info!(
                     "[hires] stopping capture (enabled={}, recording={}, worn={})",
                     enabled, recording, worn
@@ -259,15 +286,17 @@ async fn monitor_loop(
                 stop_capture(capture.take().unwrap(), &aacp).await;
                 // STOP leaves A2DP in the AirPods' mic-active state: media keeps
                 // playing from only one earbud until the transport is cycled.
-                // Skipped when the buds came out: the START on re-insertion resets.
-                if reset_a2dp {
-                    schedule_a2dp_reset(&addr);
-                }
+                // Also when the buds came out: if the call ends before a bud goes
+                // back in (and the card isn't switched off meanwhile) there is no
+                // START to reset it later. The reset skips itself if the card is off.
+                schedule_a2dp_reset(&addr);
                 if let Some(prev) = old_convo_state.take() {
                     restore_conversation_detection(&aacp, prev).await;
                 }
                 status.reset();
                 restart_backoff = STALL_TIMEOUT;
+                failed_restarts = 0;
+                gave_up_at_ear = None;
             }
             CaptureAction::Idle => {}
         }
@@ -421,29 +450,17 @@ mod tests {
     }
 
     #[test]
-    fn buds_out_stops_without_reset_and_never_restarts() {
-        assert_eq!(
-            capture_action(true, true, false, true, true),
-            CaptureAction::Stop { reset_a2dp: false }
-        );
-        assert_eq!(
-            capture_action(true, true, false, true, false),
-            CaptureAction::Stop { reset_a2dp: false }
-        );
+    fn buds_out_stops_and_never_restarts() {
+        assert_eq!(capture_action(true, true, false, true, true), CaptureAction::Stop);
+        assert_eq!(capture_action(true, true, false, true, false), CaptureAction::Stop);
     }
 
     #[test]
-    fn app_closing_mic_while_worn_stops_with_reset() {
+    fn app_closing_mic_or_disabling_stops() {
         // Leaving a Discord call: recorder gone, buds still in.
-        assert_eq!(
-            capture_action(true, false, true, true, false),
-            CaptureAction::Stop { reset_a2dp: true }
-        );
+        assert_eq!(capture_action(true, false, true, true, false), CaptureAction::Stop);
         // Feature disabled mid-capture.
-        assert_eq!(
-            capture_action(false, true, true, true, false),
-            CaptureAction::Stop { reset_a2dp: true }
-        );
+        assert_eq!(capture_action(false, true, true, true, false), CaptureAction::Stop);
     }
 
     #[test]

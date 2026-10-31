@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::task::JoinSet;
@@ -397,6 +397,8 @@ pub struct AACPManager {
     /// listener, command/subscriber loops) watch this and exit when it drops, so
     /// they don't pile up across reconnects.
     connected: Arc<watch::Sender<bool>>,
+    /// Incremented on every ear-detection report.
+    ear_generation: Arc<AtomicU64>,
 }
 
 impl AACPManager {
@@ -412,7 +414,13 @@ impl AACPManager {
             mic_status: crate::audio::hires_mic::MicStatus::new(),
             runtime: tokio::runtime::Handle::current(),
             connected: Arc::new(watch::channel(false).0),
+            ear_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Changes whenever the AirPods report a new ear-detection state.
+    pub fn ear_generation(&self) -> u64 {
+        self.ear_generation.load(Ordering::Relaxed)
     }
 
     /// Resolves once this connection has ended (immediately if it never came up).
@@ -841,6 +849,7 @@ impl AACPManager {
                     state.ear_detection_status
                 );
                 drop(state);
+                self.ear_generation.fetch_add(1, Ordering::Relaxed);
                 // The hi-res monitor ties capture to "a bud is in an ear"; re-check now.
                 self.hires_wake.notify_one();
             }
