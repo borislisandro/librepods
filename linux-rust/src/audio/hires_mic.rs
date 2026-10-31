@@ -17,7 +17,7 @@ use crate::audio::output::{self, Output, VirtualMic};
 use crate::bluetooth::aacp::AACPManager;
 use crate::bluetooth::aacp_audio;
 
-/// Delay after sending 0x58 START before resetting the A2DP transport
+/// Delay after sending 0x58 START/STOP before resetting the A2DP transport
 const A2DP_RESET_DELAY: Duration = Duration::from_millis(800);
 /// How often the monitor polls the virtual source for activity
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -195,6 +195,10 @@ async fn monitor_loop(
                     enabled, recording
                 );
                 stop_capture(capture.take().unwrap(), &aacp).await;
+                // STOP leaves A2DP in the AirPods' mic-active state: media keeps
+                // playing from only one earbud until the transport is cycled.
+                // (Not done on a stall restart above: the START that follows resets.)
+                schedule_a2dp_reset(&addr);
                 if let Some(prev) = old_convo_state.take() {
                     aacp.set_conversation_detection(prev).await;
                 }
@@ -235,15 +239,21 @@ async fn start_capture(aacp: &AACPManager, addr: &str, status: &MicStatus) -> Op
     }
     info!("[aacp] microphone stream started");
 
+    schedule_a2dp_reset(addr);
+
+    Some(Capture {
+        decode_thread: Some(decode_thread),
+    })
+}
+
+// Cycle the A2DP card profile shortly after a 0x58 START or STOP; both leave the
+// transport in a bad state (silent after START, one earbud only after STOP).
+fn schedule_a2dp_reset(addr: &str) {
     let reset_addr = addr.to_string();
     tokio::spawn(async move {
         tokio::time::sleep(A2DP_RESET_DELAY).await;
         let _ = tokio::task::spawn_blocking(move || output::reset_a2dp(&reset_addr)).await;
     });
-
-    Some(Capture {
-        decode_thread: Some(decode_thread),
-    })
 }
 
 async fn stop_capture(mut capture: Capture, aacp: &AACPManager) {
@@ -255,8 +265,8 @@ async fn stop_capture(mut capture: Capture, aacp: &AACPManager) {
     if let Some(handle) = capture.decode_thread.take() {
         let _ = tokio::task::spawn_blocking(move || handle.join()).await;
     }
-    // No A2DP reset here: only START leaves the transport broken, and resetting on STOP
-    // just adds a second stutter.
+    // The A2DP reset after a STOP is scheduled by the caller (monitor_loop), so a
+    // stall restart (STOP immediately followed by START) only resets once.
 }
 
 fn spawn_decode_thread(
