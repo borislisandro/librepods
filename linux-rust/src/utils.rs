@@ -169,6 +169,11 @@ pub struct AppSettings {
     pub hires_mic_agc: bool,
     pub hires_mic_pause_convo: bool,
     pub a2dp_reset: bool,
+    /// Both buds out: switch the AirPods' audio off so apps move to another
+    /// output (moved back when a bud goes in again).
+    pub audio_off_when_not_wearing: bool,
+    /// One bud out: pause media like an iPhone (otherwise keep playing).
+    pub pause_when_one_removed: bool,
 }
 
 impl Default for AppSettings {
@@ -181,6 +186,8 @@ impl Default for AppSettings {
             hires_mic_agc: true,
             hires_mic_pause_convo: true,
             a2dp_reset: true,
+            audio_off_when_not_wearing: true,
+            pause_when_one_removed: false,
         }
     }
 }

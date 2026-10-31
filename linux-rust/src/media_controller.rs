@@ -47,10 +47,10 @@ struct MediaControllerState {
     device_index: Option<u32>,
     cached_a2dp_profile: String,
     old_in_ear_data: Vec<bool>,
-    user_played_the_media: bool,
-    i_paused_the_media: bool,
     ear_detection_enabled: bool,
-    disconnect_when_not_wearing: bool,
+    /// Playback streams that were on the AirPods when we switched the card off,
+    /// moved back when the card comes back.
+    saved_streams: Vec<u32>,
     conv_original_volume: Option<u32>,
     conv_conversation_started: bool,
     playback_listener_running: bool,
@@ -66,10 +66,8 @@ impl MediaControllerState {
             device_index: None,
             cached_a2dp_profile: String::new(),
             old_in_ear_data: vec![false, false],
-            user_played_the_media: false,
-            i_paused_the_media: false,
             ear_detection_enabled: true,
-            disconnect_when_not_wearing: true,
+            saved_streams: Vec::new(),
             conv_original_volume: None,
             conv_conversation_started: false,
             playback_listener_running: false,
@@ -212,11 +210,6 @@ impl MediaController {
         old_statuses: Vec<EarDetectionStatus>,
         new_statuses: Vec<EarDetectionStatus>,
     ) {
-        debug!(
-            "Entering handle_ear_detection with old_statuses: {:?}, new_statuses: {:?}",
-            old_statuses, new_statuses
-        );
-
         let old_in_ear_data: Vec<bool> = old_statuses
             .iter()
             .map(|s| *s == EarDetectionStatus::InEar)
@@ -225,87 +218,58 @@ impl MediaController {
             .iter()
             .map(|s| *s == EarDetectionStatus::InEar)
             .collect();
-
-        let in_ear = new_in_ear_data.iter().all(|&b| b);
-        let old_all_out = old_in_ear_data.iter().all(|&b| !b);
-        let new_has_at_least_one_in = new_in_ear_data.iter().any(|&b| b);
-        let new_all_out = new_in_ear_data.iter().all(|&b| !b);
-
-        debug!(
-            "Computed states: in_ear={}, old_all_out={}, new_has_at_least_one_in={}, new_all_out={}",
-            in_ear, old_all_out, new_has_at_least_one_in, new_all_out
+        info!(
+            "Ear Detection - old_in_ear_data: {:?}, new_in_ear_data: {:?}",
+            old_in_ear_data, new_in_ear_data
         );
 
         {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
+            state.old_in_ear_data = new_in_ear_data.clone();
             if !state.ear_detection_enabled {
                 debug!("Ear detection disabled, skipping");
                 return;
             }
         }
 
-        if new_has_at_least_one_in && old_all_out {
-            debug!("Condition met: buds inserted, activating A2DP and checking play state");
-            self.activate_a2dp_profile().await;
-            {
-                let mut state = self.state.lock().await;
-                if state.is_playing {
-                    state.user_played_the_media = true;
-                    debug!("Set user_played_the_media to true as media was playing");
-                }
-            }
-        } else if new_all_out {
-            debug!("Condition met: buds removed, pausing media");
-            self.pause().await;
-            {
-                let state = self.state.lock().await;
-                if state.disconnect_when_not_wearing {
-                    debug!("Disconnect when not wearing enabled, deactivating A2DP");
-                    drop(state);
-                    self.deactivate_a2dp_profile().await;
-                }
-            }
-        }
-
-        let reset_user_played = (old_in_ear_data.iter().any(|&b| !b)
-            && new_in_ear_data.iter().all(|&b| b))
-            || (new_in_ear_data.iter().any(|&b| !b) && old_in_ear_data.iter().all(|&b| b));
-        if reset_user_played {
-            debug!("Transition detected, resetting user_played_the_media");
-            let mut state = self.state.lock().await;
-            state.user_played_the_media = false;
-        }
-
-        info!(
-            "Ear Detection - old_in_ear_data: {:?}, new_in_ear_data: {:?}",
-            old_in_ear_data, new_in_ear_data
+        let settings = crate::utils::AppSettings::load();
+        let actions = ear_actions(
+            &old_in_ear_data,
+            &new_in_ear_data,
+            settings.audio_off_when_not_wearing,
+            settings.pause_when_one_removed,
         );
+        debug!("Ear actions: {:?}", actions);
 
-        let mut old_sorted = old_in_ear_data.clone();
-        old_sorted.sort();
-        let mut new_sorted = new_in_ear_data.clone();
-        new_sorted.sort();
-        if new_sorted != old_sorted {
-            debug!("Ear data changed, checking resume/pause logic");
-            if in_ear {
-                debug!("Resuming media as buds are in ear");
-                self.resume().await;
-                self.state.lock().await.i_paused_the_media = false;
-            } else if !old_all_out {
-                debug!("Pausing media as buds are not fully in ear");
-                self.pause().await;
-                self.state.lock().await.i_paused_the_media = true;
-            } else {
-                debug!("Playing media");
-                self.resume().await;
-                self.state.lock().await.i_paused_the_media = false;
-            }
+        if actions.pause {
+            self.pause().await;
         }
-
-        {
-            let mut state = self.state.lock().await;
-            state.old_in_ear_data = new_in_ear_data;
-            debug!("Updated old_in_ear_data to {:?}", state.old_in_ear_data);
+        if actions.activate_a2dp {
+            self.activate_a2dp_profile().await;
+        }
+        if actions.resume {
+            self.resume().await;
+        }
+        if actions.deactivate_a2dp {
+            // Debounced: adjusting a bud briefly reports both out. Media is
+            // already paused; only switch the output if nobody put a bud back.
+            let controller = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(AUDIO_OFF_DEBOUNCE).await;
+                let still_out = !controller
+                    .state
+                    .lock()
+                    .await
+                    .old_in_ear_data
+                    .iter()
+                    .any(|&b| b);
+                if still_out {
+                    info!("No bud in ear; switching audio to another output");
+                    controller.deactivate_a2dp_profile().await;
+                } else {
+                    debug!("Bud back in ear within debounce; keeping AirPods audio");
+                }
+            });
         }
     }
 
@@ -381,6 +345,7 @@ impl MediaController {
             if active.as_deref() == Some(preferred_profile.as_str()) {
                 // Re-setting the same profile restarts the transport for nothing.
                 debug!("A2DP profile {} already active", preferred_profile);
+                self.restore_saved_streams(idx).await;
                 return;
             }
             info!("Activating A2DP profile for AirPods: {}", preferred_profile);
@@ -393,6 +358,7 @@ impl MediaController {
 
             if success {
                 info!("Successfully activated A2DP profile: {}", preferred_profile);
+                self.restore_saved_streams(idx).await;
             } else {
                 warn!("Failed to activate A2DP profile: {}", preferred_profile);
             }
@@ -682,6 +648,16 @@ impl MediaController {
         let device_index = state.device_index.unwrap();
         drop(state);
 
+        // Remember which apps were playing to the AirPods; streams that target
+        // the AirPods explicitly don't follow the default sink back by themselves.
+        let streams = tokio::task::spawn_blocking(move || card::streams_on_card(device_index))
+            .await
+            .unwrap_or_default();
+        if !streams.is_empty() {
+            debug!("Saving {} stream(s) to move back later", streams.len());
+            self.state.lock().await.saved_streams = streams;
+        }
+
         info!("Deactivating A2DP profile for AirPods by setting to off");
 
         let success = tokio::task::spawn_blocking(move || {
@@ -910,6 +886,122 @@ impl MediaController {
                 s.starts_with("org.mpris.MediaPlayer2.") && !Self::is_kdeconnect_service(s)
             })
             .collect()
+    }
+}
+
+/// How long "both buds out" must last before audio switches to another output.
+const AUDIO_OFF_DEBOUNCE: Duration = Duration::from_millis(1500);
+
+impl MediaController {
+    /// Move streams saved at deactivation back onto the AirPods' sink.
+    async fn restore_saved_streams(&self, card_index: u32) {
+        let streams = std::mem::take(&mut self.state.lock().await.saved_streams);
+        if streams.is_empty() {
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(move || {
+            card::move_streams_to_card(&streams, card_index, Duration::from_secs(3))
+        })
+        .await;
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EarActions {
+    pause: bool,
+    resume: bool,
+    activate_a2dp: bool,
+    deactivate_a2dp: bool,
+}
+
+/// What an ear-detection change should do. `old`/`new` are per-bud "in ear"
+/// flags; `old` is empty on the first report after connecting.
+///
+/// - 0 buds in (from >= 1): pause media; switch audio away if
+///   `audio_off_when_not_wearing` (debounced by the caller).
+/// - >= 1 bud in (from 0): bring the AirPods' audio back and resume what we paused.
+/// - 2 -> 1 / 1 -> 2: keep playing, unless `pause_when_one_removed`.
+fn ear_actions(
+    old: &[bool],
+    new: &[bool],
+    audio_off_when_not_wearing: bool,
+    pause_when_one_removed: bool,
+) -> EarActions {
+    let old_in = old.iter().filter(|&&b| b).count();
+    let new_in = new.iter().filter(|&&b| b).count();
+    let first_report = old.is_empty();
+    let mut a = EarActions::default();
+
+    if new_in == 0 {
+        if old_in > 0 {
+            a.pause = true;
+            a.deactivate_a2dp = audio_off_when_not_wearing;
+        } else if first_report {
+            // Connected while not worn (e.g. buds on the desk): don't grab audio.
+            a.deactivate_a2dp = audio_off_when_not_wearing;
+        }
+    } else if old_in == 0 {
+        a.activate_a2dp = true;
+        a.resume = !first_report;
+    } else if new_in < old_in {
+        a.pause = pause_when_one_removed;
+    } else if new_in > old_in {
+        a.resume = pause_when_one_removed;
+    }
+    a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EarActions, ear_actions};
+
+    const BOTH: [bool; 2] = [true, true];
+    const ONE: [bool; 2] = [true, false];
+    const NONE: [bool; 2] = [false, false];
+
+    #[test]
+    fn one_bud_out_keeps_playing_by_default() {
+        assert_eq!(ear_actions(&BOTH, &ONE, true, false), EarActions::default());
+        assert_eq!(ear_actions(&ONE, &BOTH, true, false), EarActions::default());
+    }
+
+    #[test]
+    fn one_bud_out_pauses_when_opted_in() {
+        let a = ear_actions(&BOTH, &ONE, true, true);
+        assert!(a.pause && !a.deactivate_a2dp);
+        assert!(ear_actions(&ONE, &BOTH, true, true).resume);
+    }
+
+    #[test]
+    fn both_out_pauses_and_switches_audio_away() {
+        for old in [BOTH, ONE] {
+            let a = ear_actions(&old, &NONE, true, false);
+            assert!(a.pause && a.deactivate_a2dp && !a.activate_a2dp);
+        }
+        let a = ear_actions(&BOTH, &NONE, false, false);
+        assert!(a.pause && !a.deactivate_a2dp);
+    }
+
+    #[test]
+    fn bud_back_in_restores_audio_and_resumes() {
+        for new in [ONE, BOTH] {
+            let a = ear_actions(&NONE, &new, true, false);
+            assert!(a.activate_a2dp && a.resume && !a.pause);
+        }
+    }
+
+    #[test]
+    fn first_report_after_connect() {
+        let a = ear_actions(&[], &BOTH, true, false);
+        assert!(a.activate_a2dp && !a.resume);
+        let a = ear_actions(&[], &NONE, true, false);
+        assert!(a.deactivate_a2dp && !a.pause);
+    }
+
+    #[test]
+    fn in_case_or_disconnected_buds_count_as_out() {
+        // [InCase, OutOfEar] -> [Disconnected, OutOfEar]: still nothing worn.
+        assert_eq!(ear_actions(&NONE, &NONE, true, false), EarActions::default());
     }
 }
 
