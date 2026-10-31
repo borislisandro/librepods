@@ -185,56 +185,20 @@ pub fn reset_a2dp(bdaddr: &str) {
         return;
     }
     let card = format!("bluez_card.{}", bdaddr.replace(':', "_"));
-    let Some((mut mainloop, mut context)) = connect() else {
-        return;
-    };
-    let mut introspect = context.introspect();
 
-    let current_profile = Rc::new(RefCell::new(None::<String>));
-    let op = introspect.get_card_info_by_name(&card, {
-        let current_profile = current_profile.clone();
-        move |result| {
-            if let ListResult::Item(item) = result {
-                *current_profile.borrow_mut() = item
-                    .active_profile
-                    .as_ref()
-                    .and_then(|p| p.name.as_ref())
-                    .map(|n| n.to_string());
-            }
-        }
-    });
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
-
-    let Some(current_profile) = current_profile.borrow().clone() else {
-        warn!("[pw] no active profile on {}; skipping A2DP reset", card);
-        mainloop.quit(Retval(0));
-        return;
-    };
-
-    // Resetting the a2dp transport can pause media players do to setting the crad profile to off
-    // Get all active media players
+    // Cycling the card profile pauses MPRIS players; remember who was playing.
     let players = playing_media_players();
 
-    info!(
-        "[pw] reset A2DP transport: {} off -> {}",
-        card, current_profile
-    );
-    let op = introspect.set_card_profile_by_name(&card, "off", None);
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
+    // Wait for an A2DP profile if the card is still being (re)activated, e.g. the
+    // mic START raced a bud going back in. Skipping the reset then left the
+    // transport silent; resetting "off -> off" did nothing.
+    if crate::audio::card::cycle_a2dp(&card, A2DP_RESET_WAIT) {
+        resume_media_players(&players);
     }
-
-    let op = introspect.set_card_profile_by_name(&card, &current_profile, None);
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
-    mainloop.quit(Retval(0));
-
-    // resume all media players after the reset
-    resume_media_players(&players);
 }
+
+/// How long a reset waits for the card to reach an A2DP profile.
+const A2DP_RESET_WAIT: Duration = Duration::from_secs(5);
 
 // MPRIS players currently reporting "Playing" (kdeconnect proxies excluded).
 fn playing_media_players() -> Vec<String> {
@@ -285,7 +249,7 @@ fn resume_media_players(services: &[String]) {
     }
 }
 
-fn connect() -> Option<(Mainloop, Context)> {
+pub(crate) fn connect() -> Option<(Mainloop, Context)> {
     let mut mainloop = Mainloop::new()?;
     let mut context = Context::new(&mainloop, "LibrePods-HiResMic")?;
     context

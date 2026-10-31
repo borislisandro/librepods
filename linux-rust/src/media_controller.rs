@@ -1,3 +1,4 @@
+use crate::audio::card::{self, CardRef};
 use crate::bluetooth::aacp::AACPManager;
 use crate::bluetooth::aacp::EarDetectionStatus;
 use dbus::arg::RefArg;
@@ -372,12 +373,23 @@ impl MediaController {
 
         let device_index = self.state.lock().await.device_index;
         if let Some(idx) = device_index {
+            let active = tokio::task::spawn_blocking(move || {
+                card::active_profile(CardRef::Index(idx))
+            })
+            .await
+            .unwrap_or(None);
+            if active.as_deref() == Some(preferred_profile.as_str()) {
+                // Re-setting the same profile restarts the transport for nothing.
+                debug!("A2DP profile {} already active", preferred_profile);
+                return;
+            }
             info!("Activating A2DP profile for AirPods: {}", preferred_profile);
             let profile_name = preferred_profile.clone();
-            let success =
-                tokio::task::spawn_blocking(move || set_card_profile_sync(idx, &profile_name))
-                    .await
-                    .unwrap_or(false);
+            let success = tokio::task::spawn_blocking(move || {
+                card::set_profile(CardRef::Index(idx), &profile_name)
+            })
+            .await
+            .unwrap_or(false);
 
             if success {
                 info!("Successfully activated A2DP profile: {}", preferred_profile);
@@ -674,10 +686,10 @@ impl MediaController {
 
         let success = tokio::task::spawn_blocking(move || {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                set_card_profile_sync(device_index, "off")
+                card::set_profile(CardRef::Index(device_index), "off")
             }))
                 .unwrap_or_else(|e| {
-                    warn!("Panic in set_card_profile_sync: {:?}", e);
+                    warn!("Panic while switching the card profile off: {:?}", e);
                     false
                 })
         })
@@ -984,20 +996,6 @@ fn get_sink_volume_percent_by_name_sync(sink_name: &str) -> Option<u32> {
     let total: f64 = info.volume.get().iter().map(|v| v.0 as f64).sum();
     let percent = ((total / channels as f64 / Volume::NORMAL.0 as f64) * 100.0).round() as u32;
     Some(percent)
-}
-
-fn set_card_profile_sync(card_index: u32, profile_name: &str) -> bool {
-    let (mut mainloop, context) = match pulse_connect() {
-        Some(c) => c,
-        None => return false,
-    };
-    let mut introspector = context.introspect();
-    let op = introspector.set_card_profile_by_index(card_index, profile_name, None);
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
-    mainloop.quit(Retval(0));
-    true
 }
 
 pub fn transition_sink_volume(sink_name: &str, target_volume: u32) -> bool {
