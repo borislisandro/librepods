@@ -168,9 +168,24 @@ impl Output {
     }
 }
 
+/// Streams below this rate are level meters (pavucontrol and KDE's volume
+/// applet open 25 Hz peak-detect streams to draw mic levels), not recorders.
+const MIN_RECORDER_RATE: u32 = 1000;
+
+/// Who records from the virtual source.
+pub enum SourceUse {
+    /// The source doesn't exist (e.g. pipewire-pulse restarted and dropped it).
+    Missing,
+    /// It exists; Some(app) if a real recorder is attached.
+    Present(Option<String>),
+}
+
 // Name of the application recording from the virtual source, or None if idle.
-pub fn source_consumer(name: &str) -> Option<String> {
-    let (mut mainloop, context) = connect()?;
+pub fn source_consumer(name: &str) -> SourceUse {
+    let Some((mut mainloop, context)) = connect() else {
+        // Can't tell; don't report it missing (that would recreate it).
+        return SourceUse::Present(None);
+    };
     let introspect = context.introspect();
 
     let index = Rc::new(Cell::new(u32::MAX));
@@ -193,7 +208,10 @@ pub fn source_consumer(name: &str) -> Option<String> {
             let app = app.clone();
             move |result| {
                 if let ListResult::Item(item) = result {
-                    if item.source == idx && app.borrow().is_none() {
+                    if item.source == idx
+                        && item.sample_spec.rate >= MIN_RECORDER_RATE
+                        && app.borrow().is_none()
+                    {
                         let label = item
                             .proplist
                             .get_str("application.name")
@@ -209,8 +227,11 @@ pub fn source_consumer(name: &str) -> Option<String> {
     }
     mainloop.quit(Retval(0));
 
+    if idx == u32::MAX {
+        return SourceUse::Missing;
+    }
     let result = app.borrow().clone();
-    result
+    SourceUse::Present(result)
 }
 
 // A2DP transport reset:
