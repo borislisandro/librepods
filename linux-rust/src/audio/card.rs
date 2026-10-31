@@ -89,17 +89,15 @@ pub fn set_profile(card: CardRef, profile: &str) -> bool {
     set_profile_unlocked(card, profile)
 }
 
-/// Cycle an A2DP card off and back on (fixes the transport after a hi-res mic
-/// START/STOP). If the card isn't on an A2DP profile yet (buds just inserted,
-/// profile still being activated) wait up to `wait` for it rather than skipping
-/// the reset or doing a useless "off -> off". Returns true if a cycle happened.
-pub fn cycle_a2dp(card: &str, wait: Duration) -> bool {
+/// Wait up to `wait` for a card to be on an A2DP profile (it may still be being
+/// activated, e.g. a bud just went back in). Doesn't hold the profile lock, so
+/// the activation can finish meanwhile.
+pub fn wait_for_a2dp(card: &str, wait: Duration) -> bool {
     let deadline = Instant::now() + wait;
     loop {
-        // Not holding the lock while waiting: activation needs it to finish.
         let current = active_profile(CardRef::Name(card));
         if current.as_deref().is_some_and(|p| p.starts_with("a2dp")) {
-            break;
+            return true;
         }
         if Instant::now() >= deadline {
             info!(
@@ -110,7 +108,11 @@ pub fn cycle_a2dp(card: &str, wait: Duration) -> bool {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
 
+/// Cycle an A2DP card off and back on (fixes the transport after a hi-res mic
+/// START/STOP). Call wait_for_a2dp first. Returns true if a cycle happened.
+pub fn cycle_a2dp(card: &str) -> bool {
     let _guard = lock();
     // Re-read under the lock: a deactivation may have won the race meanwhile.
     let Some(profile) = active_profile(CardRef::Name(card)).filter(|p| p.starts_with("a2dp"))
@@ -149,25 +151,36 @@ fn sinks_of_card(card_index: u32) -> Vec<u32> {
     result
 }
 
-/// Playback streams (sink-input indices) currently playing to a card's sinks.
-/// Recorded before switching the card off so they can be moved back later.
-pub fn streams_on_card(card_index: u32) -> Vec<u32> {
-    let sinks = sinks_of_card(card_index);
-    if sinks.is_empty() {
-        return Vec::new();
-    }
+/// A playback stream remembered while the AirPods' card is off. PipeWire reuses
+/// object ids, so the app name is kept too and checked before moving it back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedStream {
+    pub index: u32,
+    pub app: Option<String>,
+}
+
+/// All playback streams (sink-inputs) with their sink and app name.
+fn list_streams() -> Vec<(SavedStream, u32)> {
     let Some((mut mainloop, context)) = connect() else {
         return Vec::new();
     };
     let introspect = context.introspect();
-    let streams: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
+    let streams: Rc<RefCell<Vec<(SavedStream, u32)>>> = Rc::new(RefCell::new(Vec::new()));
     let op = introspect.get_sink_input_info_list({
         let streams = streams.clone();
         move |result| {
-            if let ListResult::Item(item) = result
-                && sinks.contains(&item.sink)
-            {
-                streams.borrow_mut().push(item.index);
+            if let ListResult::Item(item) = result {
+                let app = item
+                    .proplist
+                    .get_str("application.name")
+                    .or_else(|| item.name.as_ref().map(|n| n.to_string()));
+                streams.borrow_mut().push((
+                    SavedStream {
+                        index: item.index,
+                        app,
+                    },
+                    item.sink,
+                ));
             }
         }
     });
@@ -179,9 +192,22 @@ pub fn streams_on_card(card_index: u32) -> Vec<u32> {
     result
 }
 
-/// Move the given playback streams (those that still exist) to the card's sink.
-/// Waits up to `wait` for the sink to appear after the profile was set.
-pub fn move_streams_to_card(streams: &[u32], card_index: u32, wait: Duration) {
+/// Playback streams currently going to a card's sinks.
+pub fn streams_on_card(card_index: u32) -> Vec<SavedStream> {
+    let sinks = sinks_of_card(card_index);
+    if sinks.is_empty() {
+        return Vec::new();
+    }
+    list_streams()
+        .into_iter()
+        .filter(|(_, sink)| sinks.contains(sink))
+        .map(|(stream, _)| stream)
+        .collect()
+}
+
+/// Move saved playback streams that still exist (same index *and* app) to the
+/// card's sink. Waits up to `wait` for the sink to appear after the profile was set.
+pub fn move_streams_to_card(streams: &[SavedStream], card_index: u32, wait: Duration) {
     if streams.is_empty() {
         return;
     }
@@ -196,25 +222,31 @@ pub fn move_streams_to_card(streams: &[u32], card_index: u32, wait: Duration) {
         }
         std::thread::sleep(Duration::from_millis(200));
     };
+    let current = list_streams();
     let Some((mut mainloop, context)) = connect() else {
         return;
     };
     let mut introspect = context.introspect();
     let mut moved = 0;
-    for &stream in streams {
+    for saved in streams {
+        let still_there = current
+            .iter()
+            .any(|(s, on_sink)| s == saved && *on_sink != sink);
+        if !still_there {
+            continue;
+        }
         let ok = Rc::new(Cell::new(false));
         let cb: Box<dyn FnMut(bool) + 'static> = {
             let ok = ok.clone();
             Box::new(move |success| ok.set(success))
         };
-        let op = introspect.move_sink_input_by_index(stream, sink, Some(cb));
+        let op = introspect.move_sink_input_by_index(saved.index, sink, Some(cb));
         while op.get_state() == OperationState::Running {
             mainloop.iterate(true);
         }
-        // A stream that ended meanwhile just fails to move; that's fine.
         if ok.get() {
             moved += 1;
         }
     }
-    info!("[pw] moved {} of {} stream(s) back to the AirPods", moved, streams.len());
+    info!("[pw] moved {} of {} saved stream(s) back to the AirPods", moved, streams.len());
 }

@@ -222,13 +222,16 @@ pub fn reset_a2dp(bdaddr: &str) {
     }
     let card = format!("bluez_card.{}", bdaddr.replace(':', "_"));
 
-    // Cycling the card profile pauses MPRIS players; remember who was playing.
-    let players = playing_media_players();
-
     // Wait for an A2DP profile if the card is still being (re)activated, e.g. the
     // mic START raced a bud going back in. Skipping the reset then left the
     // transport silent; resetting "off -> off" did nothing.
-    if crate::audio::card::cycle_a2dp(&card, A2DP_RESET_WAIT) {
+    if !crate::audio::card::wait_for_a2dp(&card, A2DP_RESET_WAIT) {
+        return;
+    }
+    // Cycling the card profile pauses MPRIS players; remember who was playing.
+    // Only now, after the wait: media resumed by the bud going back in counts.
+    let players = playing_media_players();
+    if crate::audio::card::cycle_a2dp(&card) {
         resume_media_players(&players);
     }
 }

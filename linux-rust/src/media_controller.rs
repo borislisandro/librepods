@@ -50,7 +50,7 @@ struct MediaControllerState {
     ear_detection_enabled: bool,
     /// Playback streams that were on the AirPods when we switched the card off,
     /// moved back when the card comes back.
-    saved_streams: Vec<u32>,
+    saved_streams: Vec<card::SavedStream>,
     conv_original_volume: Option<u32>,
     conv_conversation_started: bool,
     playback_listener_running: bool,
