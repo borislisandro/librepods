@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle as TokioHandle;
@@ -17,14 +17,65 @@ use crate::audio::output::{self, Output, VirtualMic};
 use crate::bluetooth::aacp::AACPManager;
 use crate::bluetooth::aacp_audio;
 
-/// Delay after sending 0x58 START before resetting the A2DP transport
+/// Delay after sending 0x58 START/STOP before resetting the A2DP transport
 const A2DP_RESET_DELAY: Duration = Duration::from_millis(800);
 /// How often the monitor polls the virtual source for activity
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
 /// If no audio SDUs arrive for this long while a capture is active, the stream
 /// is considered stalled and the capture is torn down and restarted.
 const STALL_TIMEOUT: Duration = Duration::from_millis(2000);
+/// How long a recorder may be gone before the capture is stopped.
+const RECORDER_GONE_GRACE: Duration = Duration::from_secs(2);
+/// Upper bound for the delay between stall restarts that keep failing.
+const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(30);
+/// After this many restarts in a row without audio, stop retrying until the ear
+/// state changes (e.g. the remaining bud doesn't stream its mic): each restart
+/// cycles A2DP, an audible cut.
+const MAX_FAILED_RESTARTS: u32 = 3;
 const LEVEL_RELEASE: f32 = 0.85;
+
+#[derive(Debug, PartialEq, Eq)]
+enum CaptureAction {
+    /// An app started recording while a bud is in an ear: send 0x58 START.
+    Start,
+    /// Capturing and the device delivers audio: nothing to do.
+    Keep,
+    /// Capturing but no audio SDUs for STALL_TIMEOUT while worn: STOP + START.
+    Restart,
+    /// Capture must end (STOP, then an A2DP reset).
+    Stop,
+    /// Not capturing and nothing to start.
+    Idle,
+}
+
+/// Decide what the hi-res monitor does this poll. The AirPods only deliver mic
+/// audio while a bud is in an ear, so capture is tied to `worn`; without that
+/// the stall watchdog restarted (and cycled A2DP) every ~2.4 s with the buds out.
+fn capture_action(
+    enabled: bool,
+    recording: bool,
+    worn: bool,
+    capturing: bool,
+    stalled: bool,
+) -> CaptureAction {
+    let want = enabled && recording && worn;
+    match (want, capturing) {
+        (true, false) => CaptureAction::Start,
+        (true, true) if stalled => CaptureAction::Restart,
+        (true, true) => CaptureAction::Keep,
+        (false, true) => CaptureAction::Stop,
+        (false, false) => CaptureAction::Idle,
+    }
+}
+
+/// Process-wide "an app is recording from the hi-res mic right now" (there is
+/// one AirPods connection at a time). Used to avoid disruptive actions such as a
+/// WirePlumber restart in the middle of a call.
+static ANY_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn any_capture_active() -> bool {
+    ANY_CAPTURE_ACTIVE.load(Ordering::Relaxed)
+}
 
 #[derive(Clone, Default)]
 pub struct MicStatus {
@@ -57,11 +108,13 @@ impl MicStatus {
 
     fn set_capture(&self, app: Option<String>) {
         self.active.store(app.is_some(), Ordering::Relaxed);
+        ANY_CAPTURE_ACTIVE.store(app.is_some(), Ordering::Relaxed);
         *self.app.lock().unwrap() = app;
     }
 
     fn reset(&self) {
         self.active.store(false, Ordering::Relaxed);
+        ANY_CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
         *self.app.lock().unwrap() = None;
         *self.last_sdu.lock().unwrap() = None;
         self.set_level(0.0);
@@ -131,11 +184,19 @@ async fn monitor_loop(
     status: MicStatus,
     stop: Arc<Notify>,
     wake: Arc<Notify>,
-    _vmic: VirtualMic,
+    mut vmic: VirtualMic,
 ) {
     let mut capture: Option<Capture> = None;
     // Conversation detection value saved while we override it off for capture.
     let mut old_convo_state: Option<bool> = None;
+    let mut restart_backoff = STALL_TIMEOUT;
+    let mut next_restart_at = Instant::now();
+    let mut failed_restarts: u32 = 0;
+    // Ear generation at which we gave up restarting; retry once it changes.
+    let mut gave_up_at_ear: Option<u64> = None;
+    // When the recorder disappeared while capturing (stop grace period).
+    let mut recorder_gone_since: Option<Instant> = None;
+    let mut source_missing_polls: u32 = 0;
     info!(
         "[hires] activity monitor started, watching '{}'",
         output::SOURCE_NAME
@@ -148,20 +209,72 @@ async fn monitor_loop(
             _ = tokio::time::sleep(POLL_INTERVAL) => {}
         }
 
-        let app = tokio::task::spawn_blocking(|| output::source_consumer(output::SOURCE_NAME))
+        let usage = tokio::task::spawn_blocking(|| output::source_consumer(output::SOURCE_NAME))
             .await
-            .unwrap_or(None);
+            .unwrap_or(output::SourceUse::Present(None));
+        let app = match usage {
+            output::SourceUse::Present(app) => {
+                source_missing_polls = 0;
+                app
+            }
+            output::SourceUse::Missing => {
+                // pipewire-pulse restarted (or the module was unloaded): the
+                // virtual mic is gone and would never come back until the AirPods
+                // reconnect. Recreate it after two polls in a row.
+                source_missing_polls += 1;
+                if source_missing_polls >= 2 {
+                    warn!("[hires] '{}' disappeared; recreating it", output::SOURCE_NAME);
+                    if let Some(c) = capture.take() {
+                        // It writes into the old, now orphaned FIFO.
+                        stop_capture(c, &aacp).await;
+                        schedule_a2dp_reset(&addr);
+                        if let Some(prev) = old_convo_state.take() {
+                            restore_conversation_detection(&aacp, prev).await;
+                        }
+                        status.reset();
+                    }
+                    let fresh = tokio::task::spawn_blocking(|| {
+                        VirtualMic::open(ELD_SAMPLE_RATE, ELD_CHANNELS as u8)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some(fresh) = fresh {
+                        // Don't run the old one's Drop: its module index belongs
+                        // to the dead server and may now name someone else's module.
+                        std::mem::forget(std::mem::replace(&mut vmic, fresh));
+                        source_missing_polls = 0;
+                    }
+                }
+                None
+            }
+        };
         let enabled = aacp.hires_mic_enabled();
-        let recording = app.is_some();
+        // Apps (Discord rejoining a call, changing audio settings) close and
+        // reopen their mic stream within a second or two. Keep capturing through
+        // a short gap instead of STOP + START, each of which cycles A2DP.
+        if app.is_some() {
+            recorder_gone_since = None;
+        } else if capture.is_some() && recorder_gone_since.is_none() {
+            recorder_gone_since = Some(Instant::now());
+        }
+        let in_grace = capture.is_some()
+            && recorder_gone_since.is_some_and(|t| t.elapsed() < RECORDER_GONE_GRACE);
+        let recording = app.is_some() || in_grace;
 
-        match (enabled, recording, capture.is_some()) {
-            (true, true, false) => {
+        let worn = aacp.is_worn().await;
+        let stalled = capture.is_some()
+            && status.since_last_sdu().is_some_and(|d| d > STALL_TIMEOUT);
+
+        match capture_action(enabled, recording, worn, capture.is_some(), stalled) {
+            CaptureAction::Start => {
                 info!("[hires] recorder detected ({:?}), starting capture", app);
                 if let Some(c) = start_capture(&aacp, &addr, &status).await {
                     status.set_capture(app);
                     capture = Some(c);
 
                     // Only disable (and remember to restore) if it was on.
+                    aacp.take_convo_user_changed();
                     if crate::utils::AppSettings::load().hires_mic_pause_convo
                         && aacp.conversation_detection_enabled().await
                     {
@@ -170,10 +283,38 @@ async fn monitor_loop(
                     }
                 }
             }
-            (true, true, true) => {
-                status.set_capture(app);
-                let stalled = status.since_last_sdu().is_some_and(|d| d > STALL_TIMEOUT);
-                if stalled {
+            CaptureAction::Keep => {
+                if app.is_some() {
+                    status.set_capture(app);
+                }
+                restart_backoff = STALL_TIMEOUT;
+                failed_restarts = 0;
+                gave_up_at_ear = None;
+            }
+            CaptureAction::Restart => {
+                if app.is_some() {
+                    status.set_capture(app);
+                }
+                if let Some(generation) = gave_up_at_ear {
+                    if aacp.ear_generation() == generation {
+                        continue;
+                    }
+                    info!("[hires] ear state changed; retrying the mic stream");
+                    gave_up_at_ear = None;
+                    failed_restarts = 0;
+                    restart_backoff = STALL_TIMEOUT;
+                    next_restart_at = Instant::now();
+                }
+                if failed_restarts >= MAX_FAILED_RESTARTS {
+                    warn!(
+                        "[hires] no mic audio after {} restarts; waiting for an ear change",
+                        failed_restarts
+                    );
+                    gave_up_at_ear = Some(aacp.ear_generation());
+                    continue;
+                }
+                if Instant::now() >= next_restart_at {
+                    failed_restarts += 1;
                     warn!(
                         "[hires] no audio from device for {}ms, restarting capture",
                         STALL_TIMEOUT.as_millis()
@@ -184,23 +325,40 @@ async fn monitor_loop(
                         warn!("[hires] capture restart failed; will retry on next poll");
                         status.reset();
                     }
+                    // Back off if the device keeps not delivering (e.g. another
+                    // device holds the AirPods' mic), instead of cycling A2DP
+                    // every couple of seconds.
+                    next_restart_at = Instant::now() + restart_backoff;
+                    restart_backoff = (restart_backoff * 2).min(MAX_RESTART_BACKOFF);
                 }
             }
-            // Disabled while capturing: end the 0x58 stream now.
-            // The virtual source stays up feeding silence, so an active
-            // recorder isn't dropped onto the AirPods' HFP mic (handsfree).
-            (_, _, true) => {
+            // Disabled, recorder gone, or no bud in an ear: end the 0x58 stream.
+            // The virtual source stays up feeding silence, so an active recorder
+            // isn't dropped onto the AirPods' HFP mic (handsfree) or another mic.
+            CaptureAction::Stop => {
                 info!(
-                    "[hires] stopping capture (enabled={}, recording={})",
-                    enabled, recording
+                    "[hires] stopping capture (enabled={}, recording={}, worn={})",
+                    enabled, recording, worn
                 );
                 stop_capture(capture.take().unwrap(), &aacp).await;
+                // STOP leaves A2DP in the AirPods' mic-active state: media keeps
+                // playing from only one earbud until the transport is cycled.
+                // Also when the buds came out: if the call ends before a bud goes
+                // back in (and the card isn't switched off meanwhile) there is no
+                // START to reset it later. The reset skips itself if the card is off.
+                schedule_a2dp_reset(&addr);
                 if let Some(prev) = old_convo_state.take() {
-                    aacp.set_conversation_detection(prev).await;
+                    restore_conversation_detection(&aacp, prev).await;
                 }
                 status.reset();
+                restart_backoff = STALL_TIMEOUT;
+                failed_restarts = 0;
+                gave_up_at_ear = None;
+                recorder_gone_since = None;
             }
-            _ => {}
+            CaptureAction::Idle => {
+                recorder_gone_since = None;
+            }
         }
 
         // Once disabled and nothing is recording from the source, unload it.
@@ -212,10 +370,26 @@ async fn monitor_loop(
     if let Some(c) = capture.take() {
         stop_capture(c, &aacp).await;
         if let Some(prev) = old_convo_state.take() {
-            aacp.set_conversation_detection(prev).await;
+            restore_conversation_detection(&aacp, prev).await;
         }
     }
     status.reset();
+}
+
+/// Turn conversation awareness back on after a capture. If the AirPods are
+/// already gone (disconnect mid-call), remember it so the next connection
+/// restores it; otherwise it stayed off on the AirPods for good.
+async fn restore_conversation_detection(aacp: &AACPManager, enabled: bool) {
+    if aacp.take_convo_user_changed() {
+        info!("[hires] conversation awareness was changed by the user; not restoring it");
+        return;
+    }
+    if !aacp.set_conversation_detection(enabled).await && enabled {
+        info!("[hires] AirPods gone; will restore conversation awareness on next connect");
+        let mut settings = crate::utils::AppSettings::load();
+        settings.convo_restore_pending = true;
+        settings.save();
+    }
 }
 
 async fn start_capture(aacp: &AACPManager, addr: &str, status: &MicStatus) -> Option<Capture> {
@@ -235,16 +409,46 @@ async fn start_capture(aacp: &AACPManager, addr: &str, status: &MicStatus) -> Op
     }
     info!("[aacp] microphone stream started");
 
-    let reset_addr = addr.to_string();
-    tokio::spawn(async move {
-        tokio::time::sleep(A2DP_RESET_DELAY).await;
-        let _ = tokio::task::spawn_blocking(move || output::reset_a2dp(&reset_addr)).await;
-    });
+    schedule_a2dp_reset(addr);
 
     Some(Capture {
         decode_thread: Some(decode_thread),
     })
 }
+
+// Cycle the A2DP card profile shortly after a 0x58 START or STOP; both leave the
+// transport in a bad state (silent after START, one earbud only after STOP).
+//
+// Coalesced: a START and STOP (or several) close together run one reset, after
+// the last of them; two back-to-back profile cycles are two audible cuts.
+fn schedule_a2dp_reset(addr: &str) {
+    {
+        let mut at = RESET_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let already_pending = at.is_some();
+        *at = Some(Instant::now() + A2DP_RESET_DELAY);
+        if already_pending {
+            debug!("[hires] A2DP reset already pending; pushed back");
+            return;
+        }
+    }
+    let reset_addr = addr.to_string();
+    tokio::spawn(async move {
+        loop {
+            let deadline = *RESET_AT.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(deadline) = deadline else { return };
+            let now = Instant::now();
+            if now >= deadline {
+                *RESET_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                break;
+            }
+            tokio::time::sleep(deadline - now).await;
+        }
+        let _ = tokio::task::spawn_blocking(move || output::reset_a2dp(&reset_addr)).await;
+    });
+}
+
+/// When the pending A2DP reset should run (None: none pending).
+static RESET_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
 async fn stop_capture(mut capture: Capture, aacp: &AACPManager) {
     if let Err(e) = aacp.send_stop_audio().await {
@@ -255,8 +459,8 @@ async fn stop_capture(mut capture: Capture, aacp: &AACPManager) {
     if let Some(handle) = capture.decode_thread.take() {
         let _ = tokio::task::spawn_blocking(move || handle.join()).await;
     }
-    // No A2DP reset here: only START leaves the transport broken, and resetting on STOP
-    // just adds a second stutter.
+    // The A2DP reset after a STOP is scheduled by the caller (monitor_loop), so a
+    // stall restart (STOP immediately followed by START) only resets once.
 }
 
 fn spawn_decode_thread(
@@ -318,4 +522,38 @@ fn spawn_decode_thread(
             );
         })
         .expect("failed to spawn hires-decode thread")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CaptureAction, capture_action};
+
+    #[test]
+    fn starts_only_when_enabled_recording_and_worn() {
+        assert_eq!(capture_action(true, true, true, false, false), CaptureAction::Start);
+        assert_eq!(capture_action(false, true, true, false, false), CaptureAction::Idle);
+        assert_eq!(capture_action(true, false, true, false, false), CaptureAction::Idle);
+        // Both buds out: an app holding the mic must not start the 0x58 stream.
+        assert_eq!(capture_action(true, true, false, false, false), CaptureAction::Idle);
+    }
+
+    #[test]
+    fn buds_out_stops_and_never_restarts() {
+        assert_eq!(capture_action(true, true, false, true, true), CaptureAction::Stop);
+        assert_eq!(capture_action(true, true, false, true, false), CaptureAction::Stop);
+    }
+
+    #[test]
+    fn app_closing_mic_or_disabling_stops() {
+        // Leaving a Discord call: recorder gone, buds still in.
+        assert_eq!(capture_action(true, false, true, true, false), CaptureAction::Stop);
+        // Feature disabled mid-capture.
+        assert_eq!(capture_action(false, true, true, true, false), CaptureAction::Stop);
+    }
+
+    #[test]
+    fn stall_restarts_only_while_capturing_and_worn() {
+        assert_eq!(capture_action(true, true, true, true, true), CaptureAction::Restart);
+        assert_eq!(capture_action(true, true, true, true, false), CaptureAction::Keep);
+    }
 }
