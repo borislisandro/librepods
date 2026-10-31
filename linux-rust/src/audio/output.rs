@@ -78,7 +78,15 @@ impl Drop for VirtualMic {
 pub struct Output {
     fifo: File,
     agc: Option<Agc>,
+    /// Bytes dropped because the FIFO was full (reader suspended).
+    dropped: u64,
 }
+
+/// O_NONBLOCK (Linux generic value; libc isn't a direct dependency).
+const O_NONBLOCK: i32 = 0o4000;
+/// Writes up to PIPE_BUF are atomic on a pipe, so a full FIFO never leaves a
+/// partial (misaligned) sample behind.
+const PIPE_BUF: usize = 4096;
 
 unsafe impl Send for Output {}
 
@@ -87,7 +95,17 @@ impl Output {
         // O_RDWR never blocks on a FIFO and keeps the pipe from ever seeing
         // "all writers closed"; we only ever write to it.
         let path = fifo_path();
-        let fifo = match OpenOptions::new().read(true).write(true).open(&path) {
+        // Non-blocking: when no app is actively recording, PipeWire suspends the
+        // pipe-source and stops reading. A blocking write then hung the decode
+        // thread once the 64 KB pipe filled (~0.5 s at 64 kHz), and stopping the
+        // capture waited on that thread forever. Live audio: drop instead.
+        use std::os::unix::fs::OpenOptionsExt;
+        let fifo = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&path)
+        {
             Ok(f) => f,
             Err(e) => {
                 error!("could not open hi-res fifo {}: {}", path, e);
@@ -101,7 +119,11 @@ impl Output {
         if agc.is_none() {
             info!("[pw] AGC disabled; passing through raw hi-res capture");
         }
-        Some(Output { fifo, agc })
+        Some(Output {
+            fifo,
+            agc,
+            dropped: 0,
+        })
     }
 
     // Write s16 PCM into the FIFO, returning the (post-AGC) peak
@@ -125,10 +147,24 @@ impl Output {
             std::slice::from_raw_parts(pcm.as_ptr() as *const u8, std::mem::size_of_val(pcm))
         };
 
-        self.fifo
-            .write_all(bytes)
-            .map(|_| peak)
-            .map_err(|e| error!("hi-res fifo write broke: {}", e))
+        for chunk in bytes.chunks(PIPE_BUF) {
+            match self.fifo.write(chunk) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Reader not consuming (source suspended): drop this audio.
+                    if self.dropped == 0 {
+                        warn!("[pw] hi-res FIFO full (source not being read); dropping audio");
+                    }
+                    self.dropped += chunk.len() as u64;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    error!("hi-res fifo write broke: {}", e);
+                    return Err(());
+                }
+            }
+        }
+        Ok(peak)
     }
 }
 
