@@ -820,6 +820,9 @@ impl AACPManager {
                     "Received Ear Detection Status: {:?}",
                     state.ear_detection_status
                 );
+                drop(state);
+                // The hi-res monitor ties capture to "a bud is in an ear"; re-check now.
+                self.hires_wake.notify_one();
             }
             opcodes::CONVERSATION_AWARENESS => {
                 if packet.len() == 10 {
