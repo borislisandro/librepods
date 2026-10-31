@@ -237,13 +237,12 @@ impl AirPodsDevice {
                             "Received EarDetection event: old_status={:?}, new_status={:?}",
                             old_status, new_status
                         );
+                        let other_device_active = aacp_manager_clone_events
+                            .other_device_using_audio(&local_mac_events)
+                            .await;
                         let controller = mc_clone.lock().await;
-                        debug!(
-                            "Calling handle_ear_detection with old_status: {:?}, new_status: {:?}",
-                            old_status, new_status
-                        );
                         controller
-                            .handle_ear_detection(old_status, new_status)
+                            .handle_ear_detection(old_status, new_status, other_device_active)
                             .await;
                     }
                     AACPEvent::BatteryInfo(battery_info) => {

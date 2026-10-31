@@ -177,6 +177,10 @@ pub struct AppSettings {
     /// Conversation awareness was switched off for a mic capture and couldn't
     /// be switched back on before the AirPods disconnected.
     pub convo_restore_pending: bool,
+    /// AirPods volume (%) from before conversation awareness lowered it, while
+    /// that is in effect; restored on the next activation if a disconnect
+    /// interrupted the normal restore.
+    pub conv_volume_restore: Option<u32>,
 }
 
 impl Default for AppSettings {
@@ -192,6 +196,7 @@ impl Default for AppSettings {
             audio_off_when_not_wearing: true,
             pause_when_one_removed: false,
             convo_restore_pending: false,
+            conv_volume_restore: None,
         }
     }
 }

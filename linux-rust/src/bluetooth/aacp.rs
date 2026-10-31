@@ -418,6 +418,17 @@ impl AACPManager {
         }
     }
 
+    /// True if a device other than this computer is currently playing media or
+    /// in a call on the AirPods (per their audio-source report).
+    pub async fn other_device_using_audio(&self, local_mac: &str) -> bool {
+        let state = self.state.lock().await;
+        state.audio_source.as_ref().is_some_and(|source| {
+            source.r#type != AudioSourceType::None
+                && source.mac != "00:00:00:00:00:00"
+                && !source.mac.eq_ignore_ascii_case(local_mac)
+        })
+    }
+
     /// Changes whenever the AirPods report a new ear-detection state.
     pub fn ear_generation(&self) -> u64 {
         self.ear_generation.load(Ordering::Relaxed)
