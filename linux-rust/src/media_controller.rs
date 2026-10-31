@@ -56,6 +56,8 @@ struct MediaControllerState {
     playback_listener_running: bool,
     /// Last seen hi-res mic state, to detect a call starting.
     mic_was_active: bool,
+    /// Last seen "another device is playing / in a call on the AirPods".
+    other_was_active: bool,
 }
 
 impl MediaControllerState {
@@ -71,6 +73,7 @@ impl MediaControllerState {
             ear_detection_enabled: true,
             saved_streams: Vec::new(),
             mic_was_active: false,
+            other_was_active: false,
             conv_original_volume: None,
             conv_conversation_started: false,
             playback_listener_running: false,
@@ -148,11 +151,14 @@ impl MediaController {
             // call equivalent of "playback started": it isn't an MPRIS player,
             // so before this a call never took the AirPods back from the iPhone.
             let mic_active = aacp_manager.mic_active();
+            let local_mac = self.state.lock().await.local_mac.clone();
+            let other_active = aacp_manager.other_device_using_audio(&local_mac).await;
 
             let mut state = self.state.lock().await;
             let was_playing = state.is_playing;
             state.is_playing = is_playing;
             let was_mic_active = std::mem::replace(&mut state.mic_was_active, mic_active);
+            let other_was_active = std::mem::replace(&mut state.other_was_active, other_active);
             drop(state);
 
             if !was_playing && is_playing {
@@ -161,6 +167,16 @@ impl MediaController {
             } else if !was_mic_active && mic_active {
                 self.take_over_audio(&aacp_manager, &control_tx, "Hi-res mic started")
                     .await;
+            } else if other_was_active && !other_active && (mic_active || is_playing) {
+                // E.g. an iPhone phone call took the AirPods in the middle of a
+                // Discord call here. When it ends nothing else would bring them
+                // back: the call's mic never stopped, so there is no new start.
+                self.take_over_audio(
+                    &aacp_manager,
+                    &control_tx,
+                    "Other device released the AirPods during a call or playback",
+                )
+                .await;
             }
         }
     }
