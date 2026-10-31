@@ -264,7 +264,7 @@ async fn monitor_loop(
                     schedule_a2dp_reset(&addr);
                 }
                 if let Some(prev) = old_convo_state.take() {
-                    aacp.set_conversation_detection(prev).await;
+                    restore_conversation_detection(&aacp, prev).await;
                 }
                 status.reset();
                 restart_backoff = STALL_TIMEOUT;
@@ -281,10 +281,22 @@ async fn monitor_loop(
     if let Some(c) = capture.take() {
         stop_capture(c, &aacp).await;
         if let Some(prev) = old_convo_state.take() {
-            aacp.set_conversation_detection(prev).await;
+            restore_conversation_detection(&aacp, prev).await;
         }
     }
     status.reset();
+}
+
+/// Turn conversation awareness back on after a capture. If the AirPods are
+/// already gone (disconnect mid-call), remember it so the next connection
+/// restores it; otherwise it stayed off on the AirPods for good.
+async fn restore_conversation_detection(aacp: &AACPManager, enabled: bool) {
+    if !aacp.set_conversation_detection(enabled).await && enabled {
+        info!("[hires] AirPods gone; will restore conversation awareness on next connect");
+        let mut settings = crate::utils::AppSettings::load();
+        settings.convo_restore_pending = true;
+        settings.save();
+    }
 }
 
 async fn start_capture(aacp: &AACPManager, addr: &str, status: &MicStatus) -> Option<Capture> {

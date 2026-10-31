@@ -174,6 +174,9 @@ pub struct AppSettings {
     pub audio_off_when_not_wearing: bool,
     /// One bud out: pause media like an iPhone (otherwise keep playing).
     pub pause_when_one_removed: bool,
+    /// Conversation awareness was switched off for a mic capture and couldn't
+    /// be switched back on before the AirPods disconnected.
+    pub convo_restore_pending: bool,
 }
 
 impl Default for AppSettings {
@@ -188,6 +191,7 @@ impl Default for AppSettings {
             a2dp_reset: true,
             audio_off_when_not_wearing: true,
             pause_when_one_removed: false,
+            convo_restore_pending: false,
         }
     }
 }

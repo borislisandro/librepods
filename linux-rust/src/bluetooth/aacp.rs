@@ -439,7 +439,8 @@ impl AACPManager {
             .is_some_and(|s| s.value.first() == Some(&0x01))
     }
 
-    pub async fn set_conversation_detection(&self, enabled: bool) {
+    /// Returns false if the command couldn't be sent (e.g. not connected).
+    pub async fn set_conversation_detection(&self, enabled: bool) -> bool {
         let value = if enabled { 0x01 } else { 0x02 };
         info!("[aacp] setting conversation detection to {}", enabled);
         if let Err(e) = self
@@ -450,7 +451,7 @@ impl AACPManager {
             .await
         {
             warn!("[hires] failed to set conversation detection: {}", e);
-            return;
+            return false;
         }
         // AirPods don't echo this back, so record it in our own status list
         // (the source of truth for conversation_detection_enabled) and push it
@@ -476,6 +477,7 @@ impl AACPManager {
                 value: vec![value],
             }));
         }
+        true
     }
 
     pub fn mic_level(&self) -> f32 {

@@ -82,6 +82,15 @@ impl AirPodsDevice {
             error!("Failed to request proximity keys: {}", e);
         }
 
+        let mut app_settings = crate::utils::AppSettings::load();
+        if app_settings.convo_restore_pending {
+            info!("Restoring conversation awareness left off by an interrupted mic capture");
+            if aacp_manager.set_conversation_detection(true).await {
+                app_settings.convo_restore_pending = false;
+                app_settings.save();
+            }
+        }
+
         let app_settings_path = get_app_settings_path();
         let settings = std::fs::read_to_string(&app_settings_path)
             .ok()
