@@ -314,49 +314,37 @@ impl MediaController {
             return;
         }
 
-        let device_index = state.device_index;
         let mac = state.connected_device_mac.clone();
         drop(state);
 
-        let mut current_device_index = device_index;
-
-        if current_device_index.is_none() {
-            warn!("Device index not found, trying to get it.");
-            // Right after the AirPods connect, ear detection can arrive before PipeWire has
-            // created the bluez card, so give it a few seconds to show up.
-            for attempt in 0..10 {
-                current_device_index = self.get_audio_device_index(&mac).await;
-                if current_device_index.is_some() {
+        // Look the card up fresh and wait for its A2DP profiles: right after the
+        // AirPods connect, ear detection can arrive before PipeWire has created
+        // the bluez card or before BlueZ has connected A2DP, and the card index
+        // changes whenever the card is recreated. Waiting replaces the old
+        // immediate WirePlumber restart, which cut every audio stream.
+        let mut ready = false;
+        for attempt in 0..A2DP_WAIT_ATTEMPTS {
+            if let Some(idx) = self.get_audio_device_index(&mac).await {
+                self.state.lock().await.device_index = Some(idx);
+                if self.is_a2dp_profile_available().await {
+                    ready = true;
                     break;
                 }
-                debug!("Bluetooth card not there yet (attempt {}), retrying", attempt + 1);
-                tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            if let Some(idx) = current_device_index {
-                self.state.lock().await.device_index = Some(idx);
-            } else {
-                warn!("Could not get device index. Cannot activate A2DP profile.");
-                return;
-            }
+            debug!("A2DP not available yet (attempt {}), waiting", attempt + 1);
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        if !self.is_a2dp_profile_available().await {
-            warn!("A2DP profile not available, attempting to restart WirePlumber");
-            if self.restart_wire_plumber().await {
-                let mut state = self.state.lock().await;
-                state.device_index = self
-                    .get_audio_device_index(&state.connected_device_mac)
-                    .await;
-                debug!(
-                    "Updated device_index after WirePlumber restart: {:?}",
-                    state.device_index
-                );
-                if !self.is_a2dp_profile_available().await {
-                    error!("A2DP profile still not available after WirePlumber restart");
-                    return;
-                }
-            } else {
-                error!("Could not restart WirePlumber, A2DP profile unavailable");
+        if !ready {
+            warn!("A2DP profile still not available after waiting");
+            if !self.restart_wire_plumber_last_resort().await {
+                return;
+            }
+            // Note: no state lock held across these calls (they take it).
+            let idx = self.get_audio_device_index(&mac).await;
+            self.state.lock().await.device_index = idx;
+            if idx.is_none() || !self.is_a2dp_profile_available().await {
+                error!("A2DP profile still not available after WirePlumber restart");
                 return;
             }
         }
@@ -622,14 +610,34 @@ impl MediaController {
             .unwrap_or(false)
     }
 
-    async fn restart_wire_plumber(&self) -> bool {
+    /// Restart WirePlumber only as a last resort: it drops every audio stream
+    /// (a Discord call included), so never during hi-res capture and at most
+    /// once per WIREPLUMBER_RESTART_COOLDOWN across the whole process.
+    async fn restart_wire_plumber_last_resort(&self) -> bool {
+        if crate::audio::hires_mic::any_capture_active() {
+            warn!("Not restarting WirePlumber during an active mic capture");
+            return false;
+        }
+        {
+            let mut last = LAST_WIREPLUMBER_RESTART
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if last.is_some_and(|t| t.elapsed() < WIREPLUMBER_RESTART_COOLDOWN) {
+                warn!("WirePlumber was restarted recently; not restarting again");
+                return false;
+            }
+            *last = Some(std::time::Instant::now());
+        }
         info!("Restarting WirePlumber to rediscover A2DP profiles");
-        let result = Command::new("systemctl")
-            .args(["--user", "restart", "wireplumber"])
-            .output();
+        let result = tokio::task::spawn_blocking(|| {
+            Command::new("systemctl")
+                .args(["--user", "restart", "wireplumber"])
+                .output()
+        })
+        .await;
 
         match result {
-            Ok(output) if output.status.success() => {
+            Ok(Ok(output)) if output.status.success() => {
                 info!("WirePlumber restarted successfully");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 true
@@ -652,11 +660,11 @@ impl MediaController {
                 if let Some(device_string) = card.proplist.get_str("device.string")
                     && device_string.contains(&mac_clone)
                 {
-                    info!("Found audio device index for MAC {}: {}", mac_clone, card.index);
+                    debug!("Found audio device index for MAC {}: {}", mac_clone, card.index);
                     return Some(card.index);
                 }
             }
-            error!("No matching Bluetooth card found for MAC address: {}", mac_clone);
+            debug!("No matching Bluetooth card found for MAC address: {}", mac_clone);
             None
         })
             .await
@@ -920,6 +928,12 @@ impl MediaController {
             .collect()
     }
 }
+
+/// ~8 s of 500 ms attempts waiting for the bluez card and its A2DP profiles.
+const A2DP_WAIT_ATTEMPTS: u32 = 16;
+const WIREPLUMBER_RESTART_COOLDOWN: Duration = Duration::from_secs(600);
+static LAST_WIREPLUMBER_RESTART: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
 
 /// How long "both buds out" must last before audio switches to another output.
 const AUDIO_OFF_DEBOUNCE: Duration = Duration::from_millis(1500);

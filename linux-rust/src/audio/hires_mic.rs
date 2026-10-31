@@ -63,6 +63,15 @@ fn capture_action(
     }
 }
 
+/// Process-wide "an app is recording from the hi-res mic right now" (there is
+/// one AirPods connection at a time). Used to avoid disruptive actions such as a
+/// WirePlumber restart in the middle of a call.
+static ANY_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn any_capture_active() -> bool {
+    ANY_CAPTURE_ACTIVE.load(Ordering::Relaxed)
+}
+
 #[derive(Clone, Default)]
 pub struct MicStatus {
     level: Arc<AtomicU32>,
@@ -94,11 +103,13 @@ impl MicStatus {
 
     fn set_capture(&self, app: Option<String>) {
         self.active.store(app.is_some(), Ordering::Relaxed);
+        ANY_CAPTURE_ACTIVE.store(app.is_some(), Ordering::Relaxed);
         *self.app.lock().unwrap() = app;
     }
 
     fn reset(&self) {
         self.active.store(false, Ordering::Relaxed);
+        ANY_CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
         *self.app.lock().unwrap() = None;
         *self.last_sdu.lock().unwrap() = None;
         self.set_level(0.0);
