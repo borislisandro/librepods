@@ -54,6 +54,8 @@ struct MediaControllerState {
     conv_original_volume: Option<u32>,
     conv_conversation_started: bool,
     playback_listener_running: bool,
+    /// Last seen hi-res mic state, to detect a call starting.
+    mic_was_active: bool,
 }
 
 impl MediaControllerState {
@@ -68,6 +70,7 @@ impl MediaControllerState {
             old_in_ear_data: vec![false, false],
             ear_detection_enabled: true,
             saved_streams: Vec::new(),
+            mic_was_active: false,
             conv_original_volume: None,
             conv_conversation_started: false,
             playback_listener_running: false,
@@ -136,55 +139,84 @@ impl MediaController {
             let is_playing = tokio::task::spawn_blocking(|| Self::check_if_playing())
                 .await
                 .unwrap_or(false);
+            // An app opening the hi-res mic (e.g. joining a Discord call) is the
+            // call equivalent of "playback started": it isn't an MPRIS player,
+            // so before this a call never took the AirPods back from the iPhone.
+            let mic_active = aacp_manager.mic_active();
 
             let mut state = self.state.lock().await;
             let was_playing = state.is_playing;
             state.is_playing = is_playing;
-            let local_mac = state.local_mac.clone();
+            let was_mic_active = std::mem::replace(&mut state.mic_was_active, mic_active);
             drop(state);
 
             if !was_playing && is_playing {
-                let aacp_state = aacp_manager.state.lock().await;
-                if !aacp_state
-                    .ear_detection_status
-                    .contains(&EarDetectionStatus::InEar)
-                {
-                    info!("Media playback started but buds not in ear, skipping takeover");
-                    continue;
-                }
-                info!("Media playback started, taking ownership and activating a2dp");
-                let _ = control_tx.send((
-                    crate::bluetooth::aacp::ControlCommandIdentifiers::OwnsConnection,
-                    vec![0x01],
-                ));
-                self.activate_a2dp_profile().await;
-
-                info!("already connected locally, hijacking connection by asking AirPods");
-
-                let connected_devices = aacp_state.connected_devices.clone();
-                for device in connected_devices {
-                    if device.mac != local_mac {
-                        if let Err(e) = aacp_manager
-                            .send_media_information(&local_mac, &device.mac, true)
-                            .await
-                        {
-                            error!("Failed to send media information to {}: {}", device.mac, e);
-                        }
-                        if let Err(e) = aacp_manager.send_smart_routing_show_ui(&device.mac).await {
-                            error!(
-                                "Failed to send smart routing show ui to {}: {}",
-                                device.mac, e
-                            );
-                        }
-                        if let Err(e) = aacp_manager.send_hijack_request(&device.mac).await {
-                            error!("Failed to send hijack request to {}: {}", device.mac, e);
-                        }
-                    }
-                }
-
-                debug!("completed playback takeover process");
+                self.take_over_audio(&aacp_manager, &control_tx, "Media playback started")
+                    .await;
+            } else if !was_mic_active && mic_active {
+                self.take_over_audio(&aacp_manager, &control_tx, "Hi-res mic started")
+                    .await;
             }
         }
+    }
+
+    /// Claim the AirPods for this computer: tell them we own the connection,
+    /// bring up A2DP and ask other connected devices (iPhone) to let go.
+    async fn take_over_audio(
+        &self,
+        aacp_manager: &AACPManager,
+        control_tx: &tokio::sync::mpsc::UnboundedSender<(
+            crate::bluetooth::aacp::ControlCommandIdentifiers,
+            Vec<u8>,
+        )>,
+        reason: &str,
+    ) {
+        // Copy what we need and release the AACP state lock right away: sending
+        // packets takes the same lock (deadlock with another device listed), and
+        // holding it through A2DP activation stalled all AirPods packet handling.
+        let (worn, connected_devices) = {
+            let aacp_state = aacp_manager.state.lock().await;
+            (
+                aacp_state
+                    .ear_detection_status
+                    .contains(&EarDetectionStatus::InEar),
+                aacp_state.connected_devices.clone(),
+            )
+        };
+        if !worn {
+            info!("{} but buds not in ear, skipping takeover", reason);
+            return;
+        }
+        info!("{}, taking ownership and activating a2dp", reason);
+        let _ = control_tx.send((
+            crate::bluetooth::aacp::ControlCommandIdentifiers::OwnsConnection,
+            vec![0x01],
+        ));
+        self.activate_a2dp_profile().await;
+
+        let local_mac = self.state.lock().await.local_mac.clone();
+        for device in connected_devices {
+            if device.mac == local_mac {
+                continue;
+            }
+            info!("Asking AirPods to hand over from {}", device.mac);
+            if let Err(e) = aacp_manager
+                .send_media_information(&local_mac, &device.mac, true)
+                .await
+            {
+                error!("Failed to send media information to {}: {}", device.mac, e);
+            }
+            if let Err(e) = aacp_manager.send_smart_routing_show_ui(&device.mac).await {
+                error!(
+                    "Failed to send smart routing show ui to {}: {}",
+                    device.mac, e
+                );
+            }
+            if let Err(e) = aacp_manager.send_hijack_request(&device.mac).await {
+                error!("Failed to send hijack request to {}: {}", device.mac, e);
+            }
+        }
+        debug!("completed takeover process");
     }
 
     fn check_if_playing() -> bool {
