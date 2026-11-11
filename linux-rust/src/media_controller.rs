@@ -730,9 +730,17 @@ impl MediaController {
     }
 
     /// Restart WirePlumber only as a last resort: it drops every audio stream
-    /// (including an ongoing call), so never during hi-res capture and at most
-    /// once per WIREPLUMBER_RESTART_COOLDOWN across the whole process.
+    /// (including an ongoing call), so only if the user opted in, never during
+    /// hi-res capture and at most once per WIREPLUMBER_RESTART_COOLDOWN across
+    /// the whole process.
     async fn restart_wire_plumber_last_resort(&self) -> bool {
+        if !crate::utils::AppSettings::load().wireplumber_restart {
+            warn!(
+                "Not restarting WirePlumber (it would cut every app's audio); \
+                 set \"wireplumber_restart\": true in app_settings.json to allow it"
+            );
+            return false;
+        }
         if crate::audio::hires_mic::any_capture_active() {
             warn!("Not restarting WirePlumber during an active mic capture");
             return false;

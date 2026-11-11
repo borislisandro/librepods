@@ -439,6 +439,17 @@ fn our_modules() -> Vec<(u32, String)> {
     result
 }
 
+/// True if a module creating our virtual mic is loaded (e.g. by an earlier run).
+pub fn leftover_module_loaded() -> bool {
+    !our_modules().is_empty()
+}
+
+/// Unload every module creating our virtual mic that isn't tracked any more.
+pub fn unload_leftover_modules() {
+    unload_stale_modules();
+    let _ = std::fs::remove_file(fifo_path());
+}
+
 fn unload_stale_modules() {
     for (index, _) in our_modules() {
         warn!("[pw] unloading stale hi-res module {}", index);

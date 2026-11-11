@@ -141,7 +141,22 @@ async fn async_main(
     }
 
     let (shutdown_tx, shutdown_rx) = unbounded_channel::<()>();
-    spawn_shutdown_handler(device_managers.clone(), shutdown_rx);
+    spawn_shutdown_handler(
+        device_managers.clone(),
+        shutdown_rx,
+        (!args.no_tray).then(|| ui_tx.clone()),
+    );
+    // Have the hi-res virtual mic ready (or gone, if the feature is off) before
+    // any AirPods connect: creating it at the first connection could land in
+    // the middle of a call, and a mic left unparked by a crashed run would
+    // otherwise stay the (silent) default until the AirPods show up.
+    tokio::spawn(async {
+        if crate::audio::hires_mic::enabled_by_config() {
+            crate::audio::hires_mic::prepare_idle_mic(&tokio::runtime::Handle::current()).await;
+        } else {
+            crate::audio::hires_mic::remove_idle_mic().await;
+        }
+    });
     spawn_open_window_handler(ui_tx.clone());
 
     let tray_handle = if args.no_tray {
@@ -200,14 +215,18 @@ async fn async_main(
     // devices: AirPods connecting in between (e.g. right after the adapter
     // appears) would otherwise not be set up until they reconnect. Signals queue
     // until the process() loop below runs.
-    let connecting: Connecting = Arc::new(std::sync::Mutex::new(HashSet::new()));
-    let connecting_sig = connecting.clone();
+    let airpods_ctx = AirPodsContext {
+        tray_handle: tray_handle.clone(),
+        ui_tx: ui_tx.clone(),
+        device_managers: device_managers.clone(),
+        local_mac: local_mac.clone(),
+        connecting: Arc::new(std::sync::Mutex::new(HashSet::new())),
+    };
+    let airpods_ctx_sig = airpods_ctx.clone();
     let managed_devices_mac_sig = managed_devices_mac.clone();
     let devices_list_sig = devices_list.clone();
     let ui_tx_sig = ui_tx.clone();
-    let tray_handle_sig = tray_handle.clone();
     let device_managers_sig = device_managers.clone();
-    let local_mac_sig = local_mac.clone();
     let conn = Connection::new_system()?;
     let rule = MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged");
     conn.add_match(rule, move |_: (), conn, msg| {
@@ -245,6 +264,9 @@ async fn async_main(
             return true;
         };
         if is_connected==0 {
+            // With the AACP "link lost" line this tells whether a drop was the
+            // whole Bluetooth connection or only the control channel.
+            info!("BlueZ: {} disconnected", addr_str);
             if let Err(e) = ui_tx_sig.send(BluetoothUIMessage::DeviceDisconnected(addr_str.clone())) {
                 warn!("Failed to send DeviceConnected UI message: {:?}", e);
             }
@@ -288,39 +310,7 @@ async fn async_main(
             .unwrap_or_else(|_| "Unknown".to_string());
         info!("AirPods connected: {}, initializing", name);
         ensure_device_registered(&addr_str, &name, devices::enums::DeviceType::AirPods);
-        let handle_clone = tray_handle_sig.clone();
-        let ui_tx_clone = ui_tx_sig.clone();
-        let device_managers_sig = device_managers_sig.clone();
-        let local_mac_sig = local_mac_sig.clone();
-        let connecting = connecting_sig.clone();
-        tokio::spawn(async move {
-            if !begin_setup(&connecting, &addr_str) {
-                info!("Already setting up {}; ignoring duplicate connect", addr_str);
-                return;
-            }
-            close_stale_link(&device_managers_sig, &addr_str).await;
-            let airpods_device =
-                AirPodsDevice::new(addr, handle_clone, ui_tx_clone.clone(), local_mac_sig).await;
-            let channel_up = airpods_device.aacp_manager.is_connected();
-            let mut managers = device_managers_sig.write().await;
-            // let dev_managers = DeviceManagers::with_both(airpods_device.aacp_manager.clone(), airpods_device.att_manager.clone());
-            let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
-            managers
-                .entry(addr_str.clone())
-                .or_insert(dev_managers)
-                .set_aacp(airpods_device.aacp_manager);
-            drop(managers);
-            end_setup(&connecting, &addr_str);
-            if !channel_up {
-                // Don't show a device whose controls can't work; the next
-                // connect signal from BlueZ sets it up again.
-                warn!("{} has no AACP channel; not showing it as connected", addr_str);
-                return;
-            }
-            if let Err(e) = ui_tx_clone.send(BluetoothUIMessage::DeviceConnected(addr_str.clone())) {
-                warn!("Failed to send DeviceConnected UI message: {:?}", e);
-            }
-        });
+        tokio::spawn(supervise_airpods(airpods_ctx_sig.clone(), addr));
         true
     })?;
 
@@ -341,40 +331,7 @@ async fn async_main(
                 &name,
                 devices::enums::DeviceType::AirPods,
             );
-            let mac_str = device.address().to_string();
-            begin_setup(&connecting, &mac_str);
-            let airpods_device = AirPodsDevice::new(
-                device.address(),
-                tray_handle.clone(),
-                ui_tx.clone(),
-                local_mac.clone(),
-            )
-            .await;
-
-            let hires_aacp = airpods_device.aacp_manager.clone();
-            let channel_up = hires_aacp.is_connected();
-            let mut managers = device_managers.write().await;
-            // let dev_managers = DeviceManagers::with_both(airpods_device.aacp_manager.clone(), airpods_device.att_manager.clone());
-            let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
-            managers
-                .entry(device.address().to_string())
-                .or_insert(dev_managers)
-                .set_aacp(airpods_device.aacp_manager);
-            drop(managers);
-            end_setup(&connecting, &mac_str);
-            if !channel_up {
-                warn!("{} has no AACP channel; not showing it as connected", mac_str);
-            } else if let Err(e) = ui_tx.send(BluetoothUIMessage::DeviceConnected(
-                device.address().to_string(),
-            )) {
-                warn!("Failed to send DeviceConnected UI message: {:?}", e);
-            }
-            // LIBREPODS_HIRES_MIC=1: enable the hi-res mic feature headlessly.
-            if env::var("LIBREPODS_HIRES_MIC").is_ok() {
-                tokio::spawn(async move {
-                    hires_aacp.set_hires_mic_enabled(true).await;
-                });
-            }
+            tokio::spawn(supervise_airpods(airpods_ctx.clone(), device.address()));
         }
         Err(_) => {
             info!("No connected AirPods found.");
@@ -438,6 +395,109 @@ async fn async_main(
     }
 }
 
+/// What setting up an AirPods connection needs.
+#[derive(Clone)]
+struct AirPodsContext {
+    tray_handle: Option<ksni::Handle<MyTray>>,
+    ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
+    device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
+    local_mac: String,
+    connecting: Connecting,
+}
+
+/// Delay before the AACP channel is opened again while BlueZ still reports the
+/// AirPods connected; doubles up to the maximum while that keeps failing.
+const RESETUP_MIN_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+const RESETUP_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Set the AirPods up and keep their AACP control channel alive for as long as
+/// BlueZ reports them connected.
+///
+/// BlueZ only signals a connect when the whole Bluetooth connection comes up.
+/// If the control channel can't be opened then, or dies later while the
+/// connection stays (audio keeps playing), nothing else would open it again:
+/// ear detection, the hi-res mic and the controls would be dead until the
+/// AirPods reconnect. The same goes for a connect signal that arrived while a
+/// setup was still running and was ignored as a duplicate.
+async fn supervise_airpods(ctx: AirPodsContext, addr: Address) {
+    let mac = addr.to_string();
+    let mut delay = RESETUP_MIN_DELAY;
+    loop {
+        if !begin_setup(&ctx.connecting, &mac) {
+            info!("Already setting up {}; ignoring duplicate connect", mac);
+            return;
+        }
+        let aacp = setup_airpods(&ctx, addr).await;
+        end_setup(&ctx.connecting, &mac);
+
+        if aacp.is_connected() {
+            let up_since = std::time::Instant::now();
+            aacp.disconnected().await;
+            if up_since.elapsed() >= RESETUP_MAX_DELAY {
+                delay = RESETUP_MIN_DELAY;
+            }
+        }
+
+        // The channel is down. Give BlueZ time to report a real disconnect.
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(RESETUP_MAX_DELAY);
+
+        // A new connect signal started its own setup meanwhile: that one is in
+        // charge now.
+        if setup_in_progress(&ctx.connecting, &mac) {
+            return;
+        }
+        let current = ctx
+            .device_managers
+            .read()
+            .await
+            .get(&mac)
+            .and_then(|m| m.get_aacp());
+        if current.is_some_and(|c| c.is_connected()) {
+            return;
+        }
+        // Gone (or unknown): the next connect signal sets them up again.
+        if crate::bluetooth::discovery::device_connected(&mac).await != Some(true) {
+            return;
+        }
+        warn!(
+            "{} is still connected but its AACP channel is down; opening it again",
+            mac
+        );
+    }
+}
+
+/// One setup of the AirPods' device stack. Returns its AACP manager (whose
+/// channel may have failed to open).
+async fn setup_airpods(
+    ctx: &AirPodsContext,
+    addr: Address,
+) -> crate::bluetooth::aacp::AACPManager {
+    let mac = addr.to_string();
+    close_stale_link(&ctx.device_managers, &mac).await;
+    let airpods_device = AirPodsDevice::new(
+        addr,
+        ctx.tray_handle.clone(),
+        ctx.ui_tx.clone(),
+        ctx.local_mac.clone(),
+    )
+    .await;
+    let aacp = airpods_device.aacp_manager.clone();
+    let mut managers = ctx.device_managers.write().await;
+    managers
+        .entry(mac.clone())
+        .or_insert(DeviceManagers::with_aacp(aacp.clone()))
+        .set_aacp(airpods_device.aacp_manager);
+    drop(managers);
+    if !aacp.is_connected() {
+        // Don't show a device whose controls can't work.
+        warn!("{} has no AACP channel; not showing it as connected", mac);
+    } else if let Err(e) = ctx.ui_tx.send(BluetoothUIMessage::DeviceConnected(mac)) {
+        warn!("Failed to send DeviceConnected UI message: {:?}", e);
+    }
+    aacp
+}
+
 /// MACs whose AirPodsDevice is being set up right now.
 type Connecting = Arc<std::sync::Mutex<HashSet<String>>>;
 
@@ -448,6 +508,13 @@ fn begin_setup(connecting: &Connecting, mac: &str) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(mac.to_string())
+}
+
+fn setup_in_progress(connecting: &Connecting, mac: &str) -> bool {
+    connecting
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(mac)
 }
 
 fn end_setup(connecting: &Connecting, mac: &str) {
@@ -559,6 +626,8 @@ fn spawn_open_window_handler(ui_tx: tokio::sync::mpsc::UnboundedSender<Bluetooth
 fn spawn_shutdown_handler(
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
     mut shutdown_rx: UnboundedReceiver<()>,
+    // The UI to close first, if there is one.
+    ui_tx: Option<tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>>,
 ) {
     tokio::spawn(async move {
         use tokio::signal::unix::{SignalKind, signal};
@@ -598,6 +667,15 @@ fn spawn_shutdown_handler(
             .is_err()
         {
             warn!("Shutdown cleanup timed out; exiting anyway");
+        }
+        // With a UI, let it close and `main` return: exiting from this thread
+        // while the UI thread is still rendering runs the exit handlers under
+        // it and has crashed inside the GPU driver.
+        if let Some(ui_tx) = ui_tx
+            && ui_tx.send(BluetoothUIMessage::Quit).is_ok()
+        {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            warn!("The UI did not close; exiting anyway");
         }
         std::process::exit(0);
     });

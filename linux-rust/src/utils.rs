@@ -202,6 +202,9 @@ pub struct AppSettings {
     /// that is in effect; restored on the next activation if a disconnect
     /// interrupted the normal restore.
     pub conv_volume_restore: Option<u32>,
+    /// Allow restarting WirePlumber as a last resort when the AirPods' A2DP
+    /// profiles don't show up. Off by default: a restart cuts every app's audio.
+    pub wireplumber_restart: bool,
 }
 
 impl Default for AppSettings {
@@ -218,6 +221,7 @@ impl Default for AppSettings {
             pause_when_one_removed: false,
             convo_restore_pending: false,
             conv_volume_restore: None,
+            wireplumber_restart: false,
         }
     }
 }

@@ -410,7 +410,7 @@ impl AACPManager {
             state: Arc::new(Mutex::new(AACPManagerState::new())),
             tasks: Arc::new(Mutex::new(JoinSet::new())),
             hires_enabled: Arc::new(AtomicBool::new(
-                crate::utils::AppSettings::load().hires_mic_enabled,
+                crate::audio::hires_mic::enabled_by_config(),
             )),
             hires_mic: Arc::new(Mutex::new(None)),
             hires_wake: Arc::new(Notify::new()),
@@ -571,8 +571,17 @@ impl AACPManager {
     pub async fn set_hires_mic_enabled(&self, enabled: bool) {
         self.hires_enabled.store(enabled, Ordering::Relaxed);
         self.hires_wake.notify_one();
-        if enabled {
-            self.arm_hires_mic().await;
+        if self.is_connected() {
+            if enabled {
+                self.arm_hires_mic().await;
+            }
+            // Disabling: the monitor sees the flag and removes the mic itself.
+        } else if enabled {
+            // No connection to run a monitor for: just have the mic ready
+            // (parked) for the next one.
+            crate::audio::hires_mic::prepare_idle_mic(&self.runtime).await;
+        } else {
+            crate::audio::hires_mic::remove_idle_mic().await;
         }
     }
 
@@ -583,6 +592,11 @@ impl AACPManager {
             return;
         }
         let mut guard = self.hires_mic.lock().await;
+        // Checked under the lock: a disconnect's disarm either ran before (and
+        // we stop here) or waits for the lock and stops what is started below.
+        if !self.is_connected() {
+            return;
+        }
         if guard.as_ref().is_some_and(|m| m.is_running()) {
             return;
         }
@@ -590,10 +604,9 @@ impl AACPManager {
         let Some(addr) = addr else {
             return;
         };
-        match crate::audio::hires_mic::HiResMic::start(self, addr, self.mic_status.clone()).await {
-            Some(mic) => *guard = Some(mic),
-            None => error!("Failed to start hi-res microphone"),
-        }
+        *guard = Some(
+            crate::audio::hires_mic::HiResMic::start(self, addr, self.mic_status.clone()).await,
+        );
     }
 
     // Tear down the virtual device + monitor without clearing the enabled flag,
@@ -613,6 +626,15 @@ impl AACPManager {
     pub async fn connect(&mut self, addr: Address) -> bool {
         const BACKOFF_SECS: [u64; 4] = [1, 2, 4, 8];
         for attempt in 0..=BACKOFF_SECS.len() {
+            // An L2CAP connect to AirPods that left meanwhile would page them
+            // (and could pull them back from the device they switched to).
+            if attempt > 0
+                && crate::bluetooth::discovery::device_connected(&addr.to_string()).await
+                    == Some(false)
+            {
+                warn!("{} is no longer connected; not retrying the AACP channel", addr);
+                return false;
+            }
             if self.try_connect(addr).await {
                 return true;
             }
@@ -1509,15 +1531,31 @@ async fn save_devices_json(json: serde_json::Result<String>) {
 
 async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
     let mut buf = vec![0u8; RECV_BUF_LEN];
-    manager.arm_hires_mic().await;
+    // Not awaited here: setting the mic up talks to the sound server, which can
+    // take seconds, and the AirPods' handshake replies must be read meanwhile.
+    // (Its own task, so aborting this one can't interrupt it half-way.)
+    {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.arm_hires_mic().await });
+    }
+    // For the disconnect log line: how long the link lasted and what came last.
+    let started = Instant::now();
+    let mut packets: u64 = 0;
+    let mut last_opcode: Option<u8> = None;
     loop {
         match sp.recv(&mut buf).await {
             Ok(0) => {
-                info!("Remote closed the connection.");
+                info!(
+                    "AACP link closed by the AirPods after {}s ({} packets, last opcode {})",
+                    started.elapsed().as_secs(),
+                    packets,
+                    fmt_opcode(last_opcode)
+                );
                 break;
             }
             Ok(n) => {
                 let data = &buf[..n];
+                packets += 1;
 
                 // Forward audio SDUs to the audio thread, leaving control SDUs for the control thread.
                 if crate::bluetooth::aacp_audio::is_audio(data) {
@@ -1533,13 +1571,20 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
                     continue;
                 }
 
+                last_opcode = data.get(4).copied();
                 debug!("Received {} bytes: {}", n, hex::encode(data));
                 manager.receive_packet(data).await;
             }
             Err(e) => {
-                debug!("Read error: {}", e);
+                // The error tells a radio drop (timed out) from the AirPods
+                // leaving on purpose (reset by peer) or the adapter going away.
                 info!(
-                    "We have probably disconnected, clearing state variables (owns=false, connected_devices=empty, control_command_status_list=empty)."
+                    "AACP link lost after {}s: {} (kind {:?}; {} packets, last opcode {})",
+                    started.elapsed().as_secs(),
+                    e,
+                    e.kind(),
+                    packets,
+                    fmt_opcode(last_opcode)
                 );
                 let mut state = manager.state.lock().await;
                 state.owns = false;
@@ -1558,6 +1603,13 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
     }
     manager.connected.send_replace(false);
     manager.disarm_hires_mic().await;
+}
+
+fn fmt_opcode(opcode: Option<u8>) -> String {
+    match opcode {
+        Some(o) => format!("{:#04x}", o),
+        None => "none".to_string(),
+    }
 }
 
 async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
@@ -1587,10 +1639,116 @@ async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
 mod tests {
     use super::{AACPManager, HEADER_BYTES, opcodes};
 
+    /// Some packets make the manager save the devices file: keep the tests
+    /// away from the user's real one.
+    fn isolate_data_dir() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let dir = std::env::temp_dir().join(format!("librepods-test-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            // SAFETY: set once, before any test reads it.
+            unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
+        });
+    }
+
+    fn packet(opcode: u8, body: &[u8]) -> Vec<u8> {
+        let mut p = HEADER_BYTES.to_vec();
+        p.extend_from_slice(&[opcode, 0x00]);
+        p.extend_from_slice(body);
+        p
+    }
+
+    /// One well-formed packet per opcode the parser handles.
+    fn valid_packets() -> Vec<Vec<u8>> {
+        vec![
+            // two batteries: (component, ?, level, status, ?)
+            packet(opcodes::BATTERY_INFO, &[2, 0x02, 1, 90, 0x02, 1, 0x04, 1, 80, 0x01, 1]),
+            packet(opcodes::CONTROL_COMMAND, &[0x0D, 0x02, 0, 0, 0]),
+            packet(opcodes::EAR_DETECTION, &[0x00, 0x01]),
+            packet(opcodes::CONVERSATION_AWARENESS, &[0x02, 0x00, 0x01, 0x01]),
+            packet(opcodes::INFORMATION, b"\x01\x02\x00\x00AirPods\x00A3063\x00Apple Inc.\x00SERIAL\x00"),
+            // one key: type, ?, length, ?, data
+            packet(opcodes::PROXIMITY_KEYS_RSP, &[1, 0x01, 0, 4, 0, 0xAA, 0xBB, 0xCC, 0xDD]),
+            packet(opcodes::STEM_PRESS, &[0x06, 0x01]),
+            packet(opcodes::AUDIO_SOURCE, &[1, 2, 3, 4, 5, 6, 0x02]),
+            packet(opcodes::CONNECTED_DEVICES, &[1, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]),
+            packet(opcodes::SMART_ROUTING_RESP, b"SetOwnershipToFalse"),
+            packet(opcodes::EQ_DATA, &[1, 2, 3]),
+            packet(0xEE, &[1, 2, 3]),
+        ]
+    }
+
+    /// The AirPods (or radio noise) can send anything: every truncation of
+    /// every packet must be handled without panicking (a panic aborts the
+    /// whole app in release builds).
+    #[tokio::test]
+    async fn truncated_packets_do_not_panic() {
+        isolate_data_dir();
+        let manager = AACPManager::new();
+        for full in valid_packets() {
+            for len in 0..=full.len() {
+                manager.receive_packet(&full[..len]).await;
+            }
+        }
+    }
+
+    /// Counts announced in a packet must not be trusted beyond its length.
+    #[tokio::test]
+    async fn oversized_counts_are_rejected() {
+        isolate_data_dir();
+        let manager = AACPManager::new();
+        manager.receive_packet(&packet(opcodes::BATTERY_INFO, &[0xFF, 1, 1, 50, 2, 1])).await;
+        assert!(manager.state.lock().await.battery_info.is_empty());
+        manager
+            .receive_packet(&packet(opcodes::PROXIMITY_KEYS_RSP, &[0xFF, 0x01, 0, 0xFF, 0, 1, 2]))
+            .await;
+        manager.receive_packet(&packet(opcodes::CONNECTED_DEVICES, &[0xFF, 0, 0, 1, 2])).await;
+        assert!(manager.state.lock().await.connected_devices.is_empty());
+    }
+
+    /// Random bytes after a valid header, for every opcode value.
+    #[tokio::test]
+    async fn random_packets_do_not_panic() {
+        isolate_data_dir();
+        let manager = AACPManager::new();
+        let mut seed: u32 = 0x2545_F491;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for round in 0..4000u32 {
+            let len = (next() % 48) as usize;
+            let body: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            manager.receive_packet(&packet(round as u8, &body)).await;
+        }
+    }
+
+    #[test]
+    fn audio_demux_stops_at_bad_lengths() {
+        use crate::bluetooth::aacp_audio::{demux_type58, is_audio};
+        let mut sdu = vec![0x04, 0x00, 0x04, 0x00, 0x58, 0x00, 0x01, 0x00];
+        assert!(is_audio(&sdu));
+        assert!(!is_audio(&sdu[..7]));
+        sdu.resize(22, 0);
+        // two complete AUs, then one announcing more than is left
+        sdu.extend_from_slice(&[0, 0, 0, 0, 2, 0xAA, 0xBB]);
+        sdu.extend_from_slice(&[0, 0, 0, 0, 1, 0xCC]);
+        sdu.extend_from_slice(&[0, 0, 0, 0, 200, 0xDD]);
+        let mut aus = Vec::new();
+        assert_eq!(demux_type58(&sdu, |au| aus.push(au.to_vec())), 2);
+        assert_eq!(aus, vec![vec![0xAA, 0xBB], vec![0xCC]]);
+        for len in 0..sdu.len() {
+            demux_type58(&sdu[..len], |_| {});
+        }
+    }
+
     /// A connected-devices packet that announces more entries than it carries
     /// must be rejected, not read past its end.
     #[tokio::test]
     async fn short_connected_devices_packet_is_rejected() {
+        isolate_data_dir();
         let manager = AACPManager::new();
         for extra in 0..2 {
             // opcode, 0x00, count = 1, then 8 + `extra` bytes: one or two

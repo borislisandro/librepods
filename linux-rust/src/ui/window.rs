@@ -292,6 +292,7 @@ impl App {
 
                         Task::perform(wait_for_message(ui_rx), |msg| msg)
                     }
+                    BluetoothUIMessage::Quit => iced::exit(),
                     BluetoothUIMessage::OpenWindow => {
                         let ui_rx = Arc::clone(&self.ui_rx);
                         let wait_task = Task::perform(wait_for_message(ui_rx), |msg| msg);

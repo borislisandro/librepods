@@ -378,7 +378,7 @@ pub fn airpods_view<'a>(
         let header = row![
             column![
                 text("Hi-Res Microphone").size(16),
-                text("Captures the AirPods' high-quality AAC-ELD microphone stream and exposes it as an 'AirPodsHiRes' input.").size(12).style(
+                text("Captures the AirPods' high-quality AAC-ELD microphone stream and exposes it as an 'AirPodsHiRes' input. The input is added or removed only while no app is recording, so turning this on or off during a call takes effect afterwards.").size(12).style(
                     |theme: &Theme| {
                         let mut style = text::Style::default();
                         style.color = Some(theme.palette().text.scale_alpha(0.7));

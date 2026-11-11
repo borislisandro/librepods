@@ -47,3 +47,49 @@ pub async fn find_other_managed_devices(
         "No other managed devices found",
     )))
 }
+
+/// Whether BlueZ currently reports the device with this address as connected.
+/// None if that can't be determined (BlueZ unreachable, device unknown).
+/// Blocking: call from spawn_blocking.
+pub fn device_connected_blocking(mac: &str) -> Option<bool> {
+    use dbus::arg::{RefArg, Variant};
+    use dbus::blocking::Connection;
+    use std::collections::HashMap;
+    type Props = HashMap<String, Variant<Box<dyn RefArg>>>;
+    type Objects = HashMap<dbus::Path<'static>, HashMap<String, Props>>;
+
+    let conn = Connection::new_system().ok()?;
+    let proxy = conn.with_proxy("org.bluez", "/", std::time::Duration::from_secs(5));
+    let (objects,): (Objects,) = proxy
+        .method_call("org.freedesktop.DBus.ObjectManager", "GetManagedObjects", ())
+        .ok()?;
+    let mut found = None;
+    for interfaces in objects.values() {
+        let Some(device) = interfaces.get("org.bluez.Device1") else {
+            continue;
+        };
+        let address = device.get("Address").and_then(|a| a.0.as_str());
+        if !address.is_some_and(|a| a.eq_ignore_ascii_case(mac)) {
+            continue;
+        }
+        let connected = device
+            .get("Connected")
+            .and_then(|c| c.0.as_u64())
+            .map(|c| c != 0);
+        // The same device can be listed under more than one adapter.
+        if connected == Some(true) {
+            return Some(true);
+        }
+        found = found.or(connected);
+    }
+    found
+}
+
+/// Async wrapper around device_connected_blocking.
+pub async fn device_connected(mac: &str) -> Option<bool> {
+    let mac = mac.to_string();
+    tokio::task::spawn_blocking(move || device_connected_blocking(&mac))
+        .await
+        .ok()
+        .flatten()
+}
