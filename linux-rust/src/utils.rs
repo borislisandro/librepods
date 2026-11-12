@@ -1,6 +1,7 @@
 use aes::Aes128;
 use aes::cipher::Array;
 use aes::cipher::{BlockCipherEncrypt, KeyInit};
+use crate::gestures::{StemAction, StemActions};
 use iced::Theme;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -184,7 +185,13 @@ impl std::fmt::Display for MyTheme {
 pub struct AppSettings {
     pub theme: MyTheme,
     pub tray_text_mode: bool,
-    pub stem_control: bool,
+    /// What each stem gesture does.
+    pub stem_actions: StemActions,
+    /// Settings from before `stem_actions`, read once to carry them over.
+    #[serde(rename = "stem_control", skip_serializing)]
+    legacy_stem_control: Option<bool>,
+    #[serde(rename = "triple_press_key", skip_serializing)]
+    legacy_triple_press_key: Option<String>,
     pub hires_mic_enabled: bool,
     pub hires_mic_agc: bool,
     pub hires_mic_pause_convo: bool,
@@ -212,7 +219,9 @@ impl Default for AppSettings {
         Self {
             theme: MyTheme::Dark,
             tray_text_mode: false,
-            stem_control: false,
+            stem_actions: StemActions::default(),
+            legacy_stem_control: None,
+            legacy_triple_press_key: None,
             hires_mic_enabled: true,
             hires_mic_agc: true,
             hires_mic_pause_convo: true,
@@ -227,13 +236,30 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    /// Carry the older stem settings over into `stem_actions`. They stay in
+    /// the file until the next save, which writes `stem_actions` without them.
+    fn migrate(mut self) -> Self {
+        if self.legacy_stem_control.take() == Some(true) {
+            if self.stem_actions.double == StemAction::Default {
+                self.stem_actions.double = StemAction::NextTrack;
+            }
+            if self.stem_actions.triple == StemAction::Default {
+                self.stem_actions.triple = StemAction::PreviousTrack;
+            }
+        }
+        if let Some(key) = self.legacy_triple_press_key.take() {
+            self.stem_actions.triple = StemAction::Key(key);
+        }
+        self
+    }
+
     pub fn load() -> Self {
         let path = get_app_settings_path();
         let Ok(text) = std::fs::read_to_string(&path) else {
             return Self::default();
         };
-        match serde_json::from_str(&text) {
-            Ok(settings) => settings,
+        match serde_json::from_str::<Self>(&text) {
+            Ok(settings) => settings.migrate(),
             Err(e) => {
                 // Defaults are used, and the next save would replace the file
                 // with them: keep a copy of what was there (once per run).
@@ -307,5 +333,24 @@ impl From<MyTheme> for Theme {
             MyTheme::Oxocarbon => Theme::Oxocarbon,
             MyTheme::Ferra => Theme::Ferra,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn older_stem_settings_carry_over() {
+        let old: AppSettings =
+            serde_json::from_str(r#"{"stem_control": true, "triple_press_key": "PageDown"}"#)
+                .unwrap();
+        let settings = old.migrate();
+        assert_eq!(settings.stem_actions.double, StemAction::NextTrack);
+        assert_eq!(settings.stem_actions.triple, StemAction::Key("PageDown".into()));
+        let saved = serde_json::to_string(&settings).unwrap();
+        assert!(!saved.contains("stem_control") && !saved.contains("triple_press_key"));
+        let reloaded = serde_json::from_str::<AppSettings>(&saved).unwrap().migrate();
+        assert_eq!(reloaded.stem_actions, settings.stem_actions);
     }
 }

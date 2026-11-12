@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
-use crate::utils::get_app_settings_path;
 
 pub struct AirPodsDevice {
     pub mac_address: Address,
@@ -100,28 +99,21 @@ impl AirPodsDevice {
             }
         }
 
-        let app_settings_path = get_app_settings_path();
-        let settings = std::fs::read_to_string(&app_settings_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-        let stem_control = settings
-            .clone()
-            .and_then(|v| v.get("stem_control").cloned())
-            .and_then(|s| serde_json::from_value(s).ok())
-            .unwrap_or(false);
-
-        if stem_control {
-            // Enable stem press detection (double and triple tap)
-            // StemConfig bitmask for the control command: single=0x01, double=0x02, triple=0x04, long=0x08
-            // We want double and triple: 0x02 | 0x04 = 0x06
-            // Note: these bitmask values differ from the StemPressType event enum values (0x05–0x08)
-            info!("Enabling stem press detection for double and triple tap");
+        let stem_actions = crate::utils::AppSettings::load().stem_actions;
+        let stem_mask = stem_actions.config_mask();
+        if stem_mask != 0 {
+            info!("Taking over remapped stem gestures (mask {:#04x})", stem_mask);
             if let Err(e) = aacp_manager
-                .send_control_command(ControlCommandIdentifiers::StemConfig, &[0x06])
+                .send_control_command(ControlCommandIdentifiers::StemConfig, &[stem_mask])
                 .await
             {
-                error!("Failed to enable stem press detection: {}", e);
+                error!("Failed to take over stem gestures: {}", e);
             }
+        }
+        if stem_actions.uses_keys() {
+            // Ahead of the first press: the desktop needs a moment to pick up
+            // a new keyboard.
+            tokio::task::spawn_blocking(crate::keypress::prepare);
         }
 
         let media_controller = Arc::new(Mutex::new(MediaController::new(
@@ -383,27 +375,43 @@ impl AirPodsDevice {
                     }
                     AACPEvent::StemPress(press_type, bud_type) => {
                         use crate::bluetooth::aacp::StemPressType;
-                        info!(
-                            "Received Stem Press: {:?} on {:?}",
-                            press_type, bud_type
-                        );
-                        if stem_control {
-                            let controller = mc_clone.lock().await;
-                            match press_type {
-                                StemPressType::DoublePress => {
-                                    info!("Double press detected, skipping to next track");
-                                    controller.next_track().await;
-                                }
-                                StemPressType::TriplePress => {
-                                    info!("Triple press detected, going to previous track");
-                                    controller.previous_track().await;
-                                }
-                                _ => {
-                                    debug!("Unhandled stem press type: {:?}", press_type);
+                        use crate::gestures::{StemAction, StemGesture};
+                        let gesture = match press_type {
+                            StemPressType::SinglePress => StemGesture::Single,
+                            StemPressType::DoublePress => StemGesture::Double,
+                            StemPressType::TriplePress => StemGesture::Triple,
+                            StemPressType::LongPress => StemGesture::Long,
+                        };
+                        // Read now, so changes in the window apply right away.
+                        let settings = crate::utils::AppSettings::load();
+                        let action = settings.stem_actions.get(gesture).clone();
+                        info!("{} on {:?}: {}", gesture.label(), bud_type, action);
+                        let aacp = &aacp_manager_clone_events;
+                        match action {
+                            // Not ours; the AirPods only report it because a
+                            // change hasn't reached them yet.
+                            StemAction::Default => {}
+                            StemAction::PlayPause => mc_clone.lock().await.play_pause().await,
+                            StemAction::NextTrack => mc_clone.lock().await.next_track().await,
+                            StemAction::PreviousTrack => {
+                                mc_clone.lock().await.previous_track().await
+                            }
+                            StemAction::CycleListeningMode => aacp.cycle_listening_mode().await,
+                            StemAction::ToggleConversationAwareness => {
+                                if settings.hires_mic_pause_convo && aacp.mic_active() {
+                                    info!(
+                                        "Conversation awareness is paused while the microphone is in use; leaving it"
+                                    );
+                                } else {
+                                    let enabled = aacp.conversation_detection_enabled().await;
+                                    aacp.set_conversation_detection_by_user(!enabled).await;
                                 }
                             }
-                        } else {
-                            debug!("Stem control disabled, ignoring stem press event");
+                            StemAction::Key(combo) => {
+                                tokio::task::spawn_blocking(move || {
+                                    crate::keypress::press(&combo)
+                                });
+                            }
                         }
                     }
                     _ => {

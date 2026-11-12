@@ -1,6 +1,8 @@
 mod audio;
 mod bluetooth;
 mod devices;
+mod gestures;
+mod keypress;
 mod media_controller;
 mod ui;
 mod utils;

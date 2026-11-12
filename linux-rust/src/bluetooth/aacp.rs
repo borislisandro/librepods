@@ -503,6 +503,38 @@ impl AACPManager {
             .is_some_and(|s| s.value.first() == Some(&0x01))
     }
 
+    /// Switch to the next listening mode, in the order the AirPods themselves
+    /// cycle through: (Off,) Transparency, Adaptive, Noise Cancellation. The
+    /// AirPods report the new mode back, which updates our state and the UI.
+    pub async fn cycle_listening_mode(&self) {
+        let (current, allow_off) = {
+            let state = self.state.lock().await;
+            let value_of = |identifier| {
+                state
+                    .control_command_status_list
+                    .iter()
+                    .find(|s| s.identifier == identifier)
+                    .and_then(|s| s.value.first().copied())
+            };
+            (
+                value_of(ControlCommandIdentifiers::ListeningMode),
+                value_of(ControlCommandIdentifiers::AllowOffOption) == Some(0x01),
+            )
+        };
+        // Off = 1, Noise Cancellation = 2, Transparency = 3, Adaptive = 4
+        let order: &[u8] = if allow_off { &[1, 3, 4, 2] } else { &[3, 4, 2] };
+        let next = current
+            .and_then(|mode| order.iter().position(|&m| m == mode))
+            .map_or(order[0], |i| order[(i + 1) % order.len()]);
+        info!("[aacp] switching listening mode from {:?} to {}", current, next);
+        if let Err(e) = self
+            .send_control_command(ControlCommandIdentifiers::ListeningMode, &[next])
+            .await
+        {
+            warn!("[aacp] failed to switch listening mode: {}", e);
+        }
+    }
+
     /// Returns false if the command couldn't be sent (e.g. not connected).
     pub async fn set_conversation_detection(&self, enabled: bool) -> bool {
         let value = if enabled { 0x01 } else { 0x02 };

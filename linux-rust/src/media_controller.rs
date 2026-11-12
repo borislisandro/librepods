@@ -645,6 +645,11 @@ impl MediaController {
         }
     }
 
+    pub async fn play_pause(&self) {
+        info!("Toggling play/pause");
+        self.mpris_command("PlayPause").await;
+    }
+
     pub async fn next_track(&self) {
         info!("Skipping to next track");
         self.mpris_command("Next").await;

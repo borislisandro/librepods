@@ -6,7 +6,10 @@ use crate::devices::enums::{
     AirPodsNoiseControlMode, AirPodsState, DeviceData, DeviceState, DeviceType, NothingAncMode,
     NothingState,
 };
+use crate::gestures::{StemAction, StemActions, StemGesture};
+use crate::keypress::KeyCombo;
 use crate::ui::airpods::airpods_view;
+use crate::ui::gestures::{StemChoice, stem_controls_card};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::nothing::nothing_view;
 use crate::utils::{AppSettings, MyTheme, get_devices_path};
@@ -85,7 +88,9 @@ pub struct App {
     device_type_state: combo_box::State<DeviceType>,
     selected_device_type: Option<DeviceType>,
     tray_text_mode: bool,
-    stem_control: bool,
+    stem_actions: StemActions,
+    /// The gesture whose keyboard key is being recorded, if any.
+    capturing_stem_key: Option<StemGesture>,
     hires_mic_enabled: bool,
     hires_mic_agc: bool,
     hires_mic_pause_convo: bool,
@@ -123,7 +128,9 @@ pub enum Message {
     CancelAddDevice,
     StateChanged(String, DeviceState),
     TrayTextModeChanged(bool), // yes, I know I should add all settings to a struct, but I'm lazy
-    StemControlChanged(bool),
+    StemChoiceSelected(StemGesture, StemChoice),
+    StemKeyCaptureCancelled,
+    KeyboardEvent(iced::keyboard::Event),
     A2dpResetChanged(bool),
     AudioOffWhenNotWearingChanged(bool),
     PauseWhenOneRemovedChanged(bool),
@@ -169,7 +176,7 @@ impl App {
         let app_settings = AppSettings::load();
         let selected_theme = app_settings.theme;
         let tray_text_mode = app_settings.tray_text_mode;
-        let stem_control = app_settings.stem_control;
+        let stem_actions = app_settings.stem_actions.clone();
         let hires_mic_enabled = app_settings.hires_mic_enabled;
         let hires_mic_agc = app_settings.hires_mic_agc;
         let hires_mic_pause_convo = app_settings.hires_mic_pause_convo;
@@ -227,7 +234,8 @@ impl App {
                 selected_device_type: None,
                 device_managers,
                 tray_text_mode,
-                stem_control,
+                stem_actions,
+                capturing_stem_key: None,
                 hires_mic_enabled,
                 hires_mic_agc,
                 hires_mic_pause_convo,
@@ -239,12 +247,46 @@ impl App {
         )
     }
 
+    /// Tell the connected AirPods which stem gestures to report to us, so a
+    /// change applies without a reconnect.
+    fn apply_stem_config(&self) -> Task<Message> {
+        let mask = self.stem_actions.config_mask();
+        let managers: Vec<_> = self
+            .device_managers
+            .blocking_read()
+            .values()
+            .filter_map(|m| m.get_aacp())
+            .collect();
+        Task::future(async move {
+            for aacp in managers {
+                if let Err(e) = aacp
+                    .send_control_command(ControlCommandIdentifiers::StemConfig, &[mask])
+                    .await
+                {
+                    error!("Failed to update stem press detection: {}", e);
+                }
+            }
+        })
+        .discard()
+    }
+
+    fn set_stem_action(&mut self, gesture: StemGesture, action: StemAction) -> Task<Message> {
+        self.stem_actions.set(gesture, action);
+        self.save_settings();
+        if self.stem_actions.uses_keys() {
+            // Ahead of the first press: the desktop needs a moment to pick up
+            // a new keyboard.
+            std::thread::spawn(crate::keypress::prepare);
+        }
+        self.apply_stem_config()
+    }
+
     fn save_settings(&self) {
         // Only the fields the window edits; the rest is written by the backend.
         AppSettings::update(|s| {
             s.theme = self.selected_theme;
             s.tray_text_mode = self.tray_text_mode;
-            s.stem_control = self.stem_control;
+            s.stem_actions = self.stem_actions.clone();
             s.hires_mic_enabled = self.hires_mic_enabled;
             s.hires_mic_agc = self.hires_mic_agc;
             s.hires_mic_pause_convo = self.hires_mic_pause_convo;
@@ -672,10 +714,44 @@ impl App {
                 self.save_settings();
                 Task::none()
             }
-            Message::StemControlChanged(is_enabled) => {
-                self.stem_control = is_enabled;
-                self.save_settings();
+            Message::StemChoiceSelected(gesture, choice) => match choice {
+                StemChoice::CaptureKey => {
+                    self.capturing_stem_key = Some(gesture);
+                    Task::none()
+                }
+                StemChoice::Action(action) => {
+                    self.capturing_stem_key = None;
+                    self.set_stem_action(gesture, action)
+                }
+            },
+            Message::StemKeyCaptureCancelled => {
+                self.capturing_stem_key = None;
                 Task::none()
+            }
+            Message::KeyboardEvent(event) => {
+                use iced::keyboard::{Event, key::Code, key::Physical};
+                let (Some(gesture), Event::KeyPressed { physical_key: Physical::Code(code), modifiers, .. }) =
+                    (self.capturing_stem_key, event)
+                else {
+                    return Task::none();
+                };
+                if code == Code::Escape {
+                    self.capturing_stem_key = None;
+                    return Task::none();
+                }
+                // Modifiers on their own and keys we can't press are skipped:
+                // keep waiting for a usable key.
+                let Some(combo) = KeyCombo::new(
+                    &format!("{code:?}"),
+                    modifiers.control(),
+                    modifiers.shift(),
+                    modifiers.alt(),
+                    modifiers.logo(),
+                ) else {
+                    return Task::none();
+                };
+                self.capturing_stem_key = None;
+                self.set_stem_action(gesture, StemAction::Key(combo.to_string()))
             }
             Message::A2dpResetChanged(is_enabled) => {
                 self.a2dp_reset = is_enabled;
@@ -1102,47 +1178,6 @@ impl App {
                                 ]
                                 .spacing(12);
 
-                            let stem_control_value = self.stem_control;
-                            let stem_control_toggle = container(
-                                row![
-                                    column![
-                                        text("Stem press track control").size(16),
-                                        text("Double press = next track, triple press = previous track. Disable if your environment handles AirPods AVRCP commands natively.").size(12).style(
-                                            |theme: &Theme| {
-                                                let mut style = text::Style::default();
-                                                style.color = Some(theme.palette().text.scale_alpha(0.7));
-                                                style
-                                            }
-                                        ).width(Length::Fill)
-                                    ].width(Length::Fill),
-                                    toggler(stem_control_value)
-                                        .on_toggle(move |is_enabled| {
-                                            Message::StemControlChanged(is_enabled)
-                                        })
-                                    .spacing(0)
-                                    .size(20)
-                                    ]
-                                        .align_y(Center)
-                                        .spacing(12)
-                                    )
-                                        .padding(Padding{
-                                            top: 5.0,
-                                            bottom: 5.0,
-                                            left: 18.0,
-                                            right: 18.0,
-                                        })
-                                        .style(
-                                            |theme: &Theme| {
-                                                let mut style = container::Style::default();
-                                                style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
-                                                let mut border = Border::default();
-                                                border.color = theme.palette().primary.scale_alpha(0.5);
-                                                style.border = border.rounded(16);
-                                                style
-                                            }
-                                        )
-                                    .align_y(Center);
-
                             let audio_off_not_wearing_value = self.audio_off_when_not_wearing;
                             let audio_off_not_wearing_toggle = container(
                                 row![
@@ -1367,11 +1402,11 @@ impl App {
                                     left: 18.0,
                                     right: 18.0,
                                 }),
-                                stem_control_toggle
+                                stem_controls_card(&self.stem_actions, self.capturing_stem_key)
                             ]
                             .spacing(12);
 
-                            container(
+                            container(scrollable(
                                 column![
                                     appearance_settings_col,
                                     Space::new().height(Length::from(20)),
@@ -1389,8 +1424,9 @@ impl App {
                                     Space::new().height(Length::from(20)),
                                     hires_mic_pause_convo_toggle,
                                 ]
-                            )
                                 .padding(20)
+                                .width(Length::Fill)
+                            ))
                                 .width(Length::Fill)
                                 .height(Length::Fill)
                         },
@@ -1574,13 +1610,17 @@ impl App {
             .values()
             .any(|s| matches!(s, DeviceState::AirPods(a) if a.hires_mic_enabled));
 
+        let mut subscriptions = vec![close];
         if mic_active {
-            let tick = iced::time::every(std::time::Duration::from_millis(50))
-                .map(|_| Message::MicLevelTick);
-            Subscription::batch([close, tick])
-        } else {
-            close
+            subscriptions.push(
+                iced::time::every(std::time::Duration::from_millis(50))
+                    .map(|_| Message::MicLevelTick),
+            );
         }
+        if self.capturing_stem_key.is_some() {
+            subscriptions.push(iced::keyboard::listen().map(Message::KeyboardEvent));
+        }
+        Subscription::batch(subscriptions)
     }
 }
 
